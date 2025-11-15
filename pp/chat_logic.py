@@ -50,7 +50,11 @@ def _print_usage(usage: Dict[str, Any], messages_sent: int, label: str) -> None:
 # HIGH-LEVEL OPERATIONS
 # =========================
 
-def ask_llm_for_chat_answer(conversation_id: int, user_text: str) -> None:
+def ask_llm_for_chat_answer(
+    conversation_id: int,
+    user_text: str,
+    model_name: str,
+) -> None:
     """
     Normal chat turn:
     - save user message
@@ -69,7 +73,12 @@ def ask_llm_for_chat_answer(conversation_id: int, user_text: str) -> None:
     messages_for_api.extend(history)
 
     try:
-        reply_text, usage = call_yandex_llm(messages_for_api)
+        reply_text, usage = call_yandex_llm(
+            messages_for_api,
+            temperature=0.6,
+            max_tokens=1500,
+            model_name=model_name,
+        )
     except LlmError as e:
         print(f"\n[ERROR] LLM call failed: {e}")
         return
@@ -84,7 +93,11 @@ def ask_llm_for_chat_answer(conversation_id: int, user_text: str) -> None:
     _print_usage(usage, messages_sent=len(messages_for_api), label="chat")
 
 
-def summarize_conversation(conversation_id: int, max_tokens_for_summary: int) -> None:
+def summarize_conversation(
+    conversation_id: int,
+    max_tokens_for_summary: int,
+    model_name: str,
+) -> None:
     """
     Summarization:
     - get active messages
@@ -110,6 +123,7 @@ def summarize_conversation(conversation_id: int, max_tokens_for_summary: int) ->
             messages_for_api,
             temperature=0.3,
             max_tokens=max_tokens_for_summary,
+            model_name=model_name,
         )
     except LlmError as e:
         print(f"\n[ERROR] LLM call failed: {e}")
