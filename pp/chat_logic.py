@@ -87,7 +87,7 @@ def ask_llm_for_chat_answer(
     save_message(conversation_id, "assistant", reply_text)
 
     # Stats and logging
-    save_stats(conversation_id, usage)
+    save_stats(conversation_id, usage, model_name=model_name)
 
     print("\nASSISTANT:\n" + reply_text)
     _print_usage(usage, messages_sent=len(messages_for_api), label="chat")
@@ -141,7 +141,7 @@ def summarize_conversation(
         is_active=True,
     )
 
-    save_stats(conversation_id, usage)
+    save_stats(conversation_id, usage, model_name=model_name)
 
     print("\nSUMMARY:\n" + reply_text)
     _print_usage(usage, messages_sent=len(messages_for_api), label="summary")

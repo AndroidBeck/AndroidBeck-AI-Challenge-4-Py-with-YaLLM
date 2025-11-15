@@ -48,6 +48,7 @@ def init_db() -> None:
         input_tokens INTEGER,
         completion_tokens INTEGER,
         total_tokens INTEGER,
+        model_name TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (conversation_id) REFERENCES conversations (id)
     )
@@ -218,6 +219,7 @@ def deactivate_all_messages_for_conversation(conversation_id: int) -> None:
 def save_stats(
     conversation_id: int,
     usage: Dict[str, Any],
+    model_name: str,
     request_id: Optional[str] = None,
 ) -> None:
     if not usage:
@@ -238,14 +240,22 @@ def save_stats(
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO stats (conversation_id, request_id, input_tokens, completion_tokens, total_tokens)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO stats (
+            conversation_id,
+            request_id,
+            input_tokens,
+            completion_tokens,
+            total_tokens,
+            model_name
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
     """, (
         conversation_id,
         request_id,
         to_int(input_tokens),
         to_int(completion_tokens),
         to_int(total_tokens),
+        model_name,
     ))
 
     conn.commit()
