@@ -379,7 +379,7 @@ def main():
 
         # Start a new conversation: deactivate ALL messages of current conv, then create new
         if lower == "/new":
-            deactivate_all_messages_for_conversation(conversation_id)
+            # deactivate_all_messages_for_conversation(conversation_id)
             conversation_id = create_conversation()
             print(f"Started NEW conversation #{conversation_id}")
             continue
