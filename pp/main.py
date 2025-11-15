@@ -3,6 +3,7 @@ from db import (
     create_conversation,
     get_last_conversation_with_active_messages,
     init_db,
+    deactivate_all_messages_for_conversation,
 )
 from chat_logic import ask_llm_for_chat_answer, summarize_conversation
 
@@ -78,6 +79,13 @@ def main() -> None:
                 max_tokens_for_summary = 400
 
             summarize_conversation(conversation_id, max_tokens_for_summary)
+            continue
+
+        # Deactivate all messages for current conversation
+        if lower == "/deactivate":
+            deactivate_all_messages_for_conversation(conversation_id)
+            print(f"All messages in conversation #{conversation_id} were deactivated.")
+            print("The next user message will start fresh context inside the same conversation.")
             continue
 
         # Normal chat turn
