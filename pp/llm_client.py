@@ -25,9 +25,8 @@ YAC_MODEL_ENV = os.getenv("YAC_MODEL", "yandexgpt")
 MODEL_MAP: Dict[int, str] = {
     1: "yandexgpt",
     2: "yandexgpt-lite",
-    3: "qwen3-30b-a3b",
-    4: "deepseek-r1-distill-qwen-32b",
-    5: "llama3.1-70b-instruct",
+    3: "qwen2.5-7b-instruct", # "qwen3-235b-a22b-fp8/latest",
+    4: "gpt-oss-120b/latest",
 }
 
 
