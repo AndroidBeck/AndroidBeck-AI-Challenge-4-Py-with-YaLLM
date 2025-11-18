@@ -164,28 +164,55 @@ async def call_weather_tool_via_mcp(
 def try_parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     """
     Try to parse the model's output as a JSON tool call.
-    Returns dict or None.
+
+    This version is tolerant of:
+    - Markdown code fences (``` or ```json)
+    - Extra explanation text around the JSON
+
+    Returns the parsed dict or None.
     """
-    text = text.strip()
-    if not (text.startswith("{") and text.endswith("}")):
-        return None
+    raw = text.strip()
 
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return None
+    # 1) Strip markdown code fences if present
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 2:
+            # Drop first line with ``` or ```json
+            raw = "\n".join(lines[1:])
+        # Drop trailing ``` if present
+        if raw.strip().endswith("```"):
+            raw = raw[: raw.rfind("```")].strip()
 
-    if not isinstance(data, dict):
-        return None
+    # 2) First try to parse the whole thing as JSON
+    def _parse_candidate(candidate: str) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("tool") != "get_current_weather":
+            return None
+        args = data.get("arguments")
+        if not isinstance(args, dict):
+            return None
+        return data
 
-    if data.get("tool") != "get_current_weather":
-        return None
+    candidate = raw.strip()
+    parsed = _parse_candidate(candidate)
+    if parsed is not None:
+        return parsed
 
-    args = data.get("arguments")
-    if not isinstance(args, dict):
-        return None
+    # 3) Fallback: try to extract the first {...} block
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = raw[start : end + 1]
+        parsed = _parse_candidate(candidate)
+        if parsed is not None:
+            return parsed
 
-    return data
+    return None
 
 
 async def chat_loop_with_weather(session: ClientSession):
