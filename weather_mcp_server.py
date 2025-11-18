@@ -1,4 +1,6 @@
 import asyncio
+import sys
+import traceback
 from typing import Optional, Literal
 
 import httpx
@@ -27,6 +29,7 @@ async def _geocode_location(
         "format": "json",
     }
     if country_code:
+        # 'country' param filters by country code (e.g. 'NL', 'US')
         params["country"] = country_code
 
     resp = await client.get(GEOCODING_URL, params=params, timeout=10)
@@ -53,7 +56,6 @@ async def _fetch_current_weather(
         "latitude": lat,
         "longitude": lon,
         "current_weather": True,
-        # unit settings
     }
 
     if units == "imperial":
@@ -98,39 +100,55 @@ async def get_current_weather(
         units: "metric" or "imperial" for temperature & wind.
 
     Returns:
-        A JSON-serializable dict with resolved location and current weather.
+        A JSON-serializable dict with resolved location and current weather,
+        or an error description.
     """
-    async with httpx.AsyncClient() as client:
-        geo = await _geocode_location(client, location, country_code)
+    try:
+        async with httpx.AsyncClient() as client:
+            geo = await _geocode_location(client, location, country_code)
 
-        lat = geo["latitude"]
-        lon = geo["longitude"]
-        resolved_name = geo.get("name")
-        resolved_country = geo.get("country_code") or geo.get("country")
+            lat = geo["latitude"]
+            lon = geo["longitude"]
+            resolved_name = geo.get("name")
+            resolved_country = geo.get("country_code") or geo.get("country")
 
-        current = await _fetch_current_weather(client, lat, lon, units)
+            current = await _fetch_current_weather(client, lat, lon, units)
 
-        # Return a compact, LLM-friendly structure
+            return {
+                "location": {
+                    "query": location,
+                    "resolved_name": resolved_name,
+                    "country_code": resolved_country,
+                    "latitude": lat,
+                    "longitude": lon,
+                },
+                "units": units,
+                "current_weather": {
+                    "temperature": current.get("temperature"),
+                    "windspeed": current.get("windspeed"),
+                    "winddirection": current.get("winddirection"),
+                    "weathercode": current.get("weathercode"),
+                    "time": current.get("time"),
+                },
+                "source": "open-meteo.com",
+            }
+    except Exception as e:
+        # Print full traceback to stderr (visible if you run the server directly)
+        tb = traceback.format_exc()
+        print(
+            "[weather_mcp_server] Error in get_current_weather:",
+            tb,
+            file=sys.stderr,
+            flush=True,
+        )
+        # Return error details to the client so you can see them from the agent
         return {
-            "location": {
-                "query": location,
-                "resolved_name": resolved_name,
-                "country_code": resolved_country,
-                "latitude": lat,
-                "longitude": lon,
-            },
+            "error": str(e),
+            "location": location,
+            "country_code": country_code,
             "units": units,
-            "current_weather": {
-                "temperature": current.get("temperature"),
-                "windspeed": current.get("windspeed"),
-                "winddirection": current.get("winddirection"),
-                "weathercode": current.get("weathercode"),
-                "time": current.get("time"),
-            },
-            "source": "open-meteo.com",
         }
 
 
 if __name__ == "__main__":
-    # STDIO transport so tools work with MCP clients like Claude / Cursor
     mcp.run(transport="stdio")
