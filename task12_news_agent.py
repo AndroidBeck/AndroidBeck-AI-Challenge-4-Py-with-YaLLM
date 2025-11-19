@@ -1,10 +1,9 @@
-# task12_news_agent.py
+# task12_news_agent.py  (обновлённая простая версия)
 
 # How to run:
 # pip install mcp httpx requests
 # set YAC_FOLDER=...
 # set YAC_API_KEY=...
-# python task12_news_agent.py
 
 import os
 import sys
@@ -19,16 +18,16 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-YAC_MODEL = "yandexgpt"  # or your preferred model
+YAC_MODEL = "yandexgpt"  # или другой, если хочешь
 
-# Path to your MCP server file
+# Путь к MCP-серверу
 NEWS_WEATHER_SERVER_PATH = "news_weather_mcp_server.py"
 
-# DEFAULT interval (seconds)
-SUMMARY_INTERVAL_SECONDS_DEFAULT = 30 * 60  # 30 минут
-
-# Where to store summaries (our "reminder log")
+# Лог с саммари (JSONL)
 SUMMARY_LOG_PATH = "news_weather_summaries.jsonl"
+
+
+# ----------------- ENV / Yandex -----------------
 
 
 def get_env_or_die(name: str) -> str:
@@ -44,8 +43,8 @@ YAC_API_KEY = get_env_or_die("YAC_API_KEY")
 
 def call_yandex(prompt: str, temperature: float = 0.3, max_tokens: int = 800):
     """
-    Simple wrapper to call YandexGPT with a single system+user prompt.
-    Returns (answer_text, token_info_dict).
+    Обёртка над YandexGPT: один system+user промпт.
+    Возвращает (текст_ответа, словарь_с_токенами).
     """
     headers = {
         "Content-Type": "application/json",
@@ -78,7 +77,7 @@ def call_yandex(prompt: str, temperature: float = 0.3, max_tokens: int = 800):
     response.raise_for_status()
     data = response.json()
 
-    # --- Extract text ---
+    # Достаём текст
     try:
         alternatives = data["result"]["alternatives"]
         message = alternatives[0]["message"]
@@ -89,7 +88,7 @@ def call_yandex(prompt: str, temperature: float = 0.3, max_tokens: int = 800):
             f"Raw: {json.dumps(data, ensure_ascii=False, indent=2)}"
         )
 
-    # --- Extract usage / tokens ---
+    # Токены
     usage = data.get("result", {}).get("usage", {}) or {}
     completion_details = usage.get("completionTokensDetails", {}) or {}
 
@@ -108,20 +107,23 @@ def call_yandex(prompt: str, temperature: float = 0.3, max_tokens: int = 800):
     return answer_text, token_info
 
 
+# ----------------- MCP tool call -----------------
+
+
 async def call_news_weather_tool_via_mcp(
     session: ClientSession,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Call MCP tool 'get_news_and_weather' and return a plain dict.
+    Вызов MCP-инструмента get_news_and_weather, возврат dict.
     """
     result = await session.call_tool("get_news_and_weather", arguments=arguments)
 
-    # Preferred: structuredContent (dict)
+    # Если FastMCP вернул structuredContent — берём его
     if getattr(result, "structuredContent", None):
         return result.structuredContent  # type: ignore[return-value]
 
-    # Fallback: parse text content as JSON if possible
+    # Иначе пытаемся взять текст и распарсить JSON
     for content in result.content:
         if isinstance(content, types.TextContent):
             try:
@@ -132,9 +134,12 @@ async def call_news_weather_tool_via_mcp(
     return {"raw": "No content returned from news+weather tool."}
 
 
+# ----------------- Prompt для саммари -----------------
+
+
 def build_summary_prompt(data: Dict[str, Any]) -> str:
     """
-    Build a prompt for YandexGPT to summarize news+weather JSON.
+    Собираем промпт для YandexGPT на основе JSON от MCP.
     """
     return f"""
 Ты — агент, который делает периодическую сводку погоды и новостей.
@@ -151,12 +156,16 @@ def build_summary_prompt(data: Dict[str, Any]) -> str:
 2. Сформировать дайджест новостей: выделить 3–5 самых интересных заголовков.
 3. Не придумывать факты, использовать только то, что есть в JSON.
 4. Писать по-русски, коротко и по делу.
-5. В конце можно добавить одну строку-комментарий вроде "В целом день спокойный" или "Много новостей про технологии".
+5. В конце можно добавить одну строку-комментарий вроде "В целом день спокойный"
+   или "Много новостей про технологии".
 
 Вот реальные данные в формате JSON:
 
 {json.dumps(data, ensure_ascii=False, indent=2)}
 """.strip()
+
+
+# ----------------- Логирование саммари -----------------
 
 
 def append_summary_to_file(
@@ -167,7 +176,7 @@ def append_summary_to_file(
     path: str = SUMMARY_LOG_PATH,
 ) -> None:
     """
-    Append one summary record to JSONL file.
+    Добавляем одну запись в JSONL-файл: raw данные + саммари + токены.
     """
     record = {
         "generated_at": when.isoformat(),
@@ -181,36 +190,35 @@ def append_summary_to_file(
         f.write("\n")
 
 
-async def run_news_weather_agent(
+# ----------------- Основной агент (фиксированный интервал) -----------------
+
+
+async def run_news_weather_agent_fixed_interval(
     session: ClientSession,
-    interval_holder: Dict[str, int],
+    interval_seconds: int,
 ):
     """
-    Infinite loop:
-    - every interval_holder["seconds"]:
-      - call MCP tool get_news_and_weather
-      - send JSON to Yandex for summarization
-      - print and log summary
+    Бесконечный цикл:
+      - каждые interval_seconds:
+        - вызываем get_news_and_weather через MCP
+        - отправляем JSON в Yandex для саммари
+        - печатаем и логируем
     """
     print("=== Day 12 – News + Weather Agent (YandexGPT + MCP) ===")
     print(
-        f"Initial summary interval: {interval_holder['seconds']} seconds "
-        f"({interval_holder['seconds'] // 60} minutes)"
+        f"Summary interval: {interval_seconds} seconds "
+        f"({interval_seconds // 60} minutes)"
     )
     print("Press Ctrl+C to stop.\n")
 
     while True:
-        # читаем текущий интервал на начало итерации
-        interval_seconds = interval_holder["seconds"]
-
         started_at = datetime.now()
         print(
-            f"[{started_at.isoformat()}] Fetching news+weather via MCP tool..."
-            f" (interval now = {interval_seconds} s)",
+            f"[{started_at.isoformat()}] Fetching news+weather via MCP tool...",
             flush=True,
         )
 
-        # 1) Call MCP tool
+        # 1) MCP tool
         try:
             data = await call_news_weather_tool_via_mcp(
                 session,
@@ -222,7 +230,7 @@ async def run_news_weather_agent(
                 },
             )
         except Exception as e:
-            print(f"[Error while calling news_weather MCP tool] {e}", flush=True)
+            print(f"[Error calling MCP tool] {e}", flush=True)
             await asyncio.sleep(interval_seconds)
             continue
 
@@ -233,28 +241,23 @@ async def run_news_weather_agent(
             flush=True,
         )
 
-        # If tool returned error, just log and wait
         if "error" in data:
-            print(
-                f"[Tool error] {data.get('error') or '(empty error message)'}",
-                flush=True,
-            )
-            # если пришёл traceback — будет видно в JSON
+            print(f"[Tool error] {data['error']}", flush=True)
             await asyncio.sleep(interval_seconds)
             continue
 
-        # 2) Build prompt for Yandex summarization
+        # 2) Промпт для Яндекса
         prompt = build_summary_prompt(data)
 
-        # 3) Call YandexGPT
+        # 3) Вызов YandexGPT
         try:
             summary_text, token_info = call_yandex(prompt)
         except Exception as e:
-            print(f"[Error while calling YandexGPT] {e}", flush=True)
+            print(f"[Yandex error] {e}", flush=True)
             await asyncio.sleep(interval_seconds)
             continue
 
-        # 4) Print summary
+        # 4) Вывод
         print("\n=== SUMMARY ===")
         print(summary_text)
         print("\nTokens:")
@@ -265,109 +268,64 @@ async def run_news_weather_agent(
             f"(reasoningTokens = {token_info.get('reasoningTokens')})",
             flush=True,
         )
-        print("=" * 60, flush=True)
+        print("=" * 60)
 
-        # 5) Save summary to JSONL file (our "reminder log")
+        # 5) Логируем
         append_summary_to_file(started_at, data, summary_text, token_info)
 
-        # 6) Wait until next tick (интервал может уже поменяться,
-        #    но мы используем тот, что был в начале этой итерации)
+        # 6) Ждём следующий тик
         await asyncio.sleep(interval_seconds)
 
 
-async def user_input_loop(interval_holder: Dict[str, int]):
-    """
-    Отдельная корутина, которая позволяет менять интервал "на лету" через консоль.
-
-    Формат:
-      - вводим число (в секундах) и жмём Enter → интервал меняется.
-      - пустая строка → игнорируем.
-    """
-    print(
-        "=== Interval control ===\n"
-        "В любой момент можете ввести новое значение интервала в СЕКУНДАХ и нажать Enter.\n"
-        "Например: 120   (это 2 минуты)\n"
-        "Текущий интервал хранится в interval_holder['seconds'].\n"
-    )
-
-    loop = asyncio.get_running_loop()
-
-    while True:
-        # input() блокирующий, поэтому гоняем его в отдельном потоке
-        try:
-            line = await asyncio.to_thread(input, "New interval (seconds, empty = skip): ")
-        except (EOFError, KeyboardInterrupt):
-            # Просто выходим из этого лупа, агент продолжит работать до Ctrl+C
-            print("\n[Interval input loop stopped]", flush=True)
-            return
-
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            value = int(line)
-        except ValueError:
-            print("[Invalid input] Please enter an integer number of seconds.", flush=True)
-            continue
-
-        if value <= 0:
-            print("[Invalid input] Interval must be > 0.", flush=True)
-            continue
-
-        interval_holder["seconds"] = value
-        print(
-            f"[Interval updated] New interval: {value} seconds "
-            f"({value // 60} minutes)",
-            flush=True,
-        )
+# ----------------- main_async: спрашиваем интервал и запускаем MCP-клиент -----------------
 
 
 async def main_async():
-    """
-    Connect to the news+weather MCP server over stdio and run the agent loop.
-    This will spawn `python news_weather_mcp_server.py` as a child process.
-    """
+    # 1. Спрашиваем интервал у пользователя
+    while True:
+        try:
+            raw = input("Введите интервал обновления (в секундах): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("Exit.")
+            return
+
+        if not raw:
+            continue
+
+        try:
+            interval_seconds = int(raw)
+            if interval_seconds <= 0:
+                print("Интервал должен быть больше 0.")
+                continue
+            break
+        except ValueError:
+            print("Введите число, пожалуйста.")
+
+    # 2. Стартуем MCP-сервер как дочерний процесс (stdio)
     server_params = StdioServerParameters(
         command="python",
         args=[NEWS_WEATHER_SERVER_PATH],
         env=None,
     )
 
-    # общий "контейнер" для интервала, чтобы две корутины могли его менять/читать
-    interval_holder: Dict[str, int] = {
-        "seconds": SUMMARY_INTERVAL_SECONDS_DEFAULT,
-    }
-
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # (Optional) list tools once to sanity-check
+            # Проверим список тулов
             tools = await session.list_tools()
             tool_names = [t.name for t in tools.tools]
             print(f"Connected to MCP news+weather server. Tools: {tool_names}\n")
 
-            # запускаем две корутины параллельно:
-            # 1) сам агент (крутится в вечном цикле)
-            # 2) обработчик ввода пользователя для смены интервала
-            agent_task = asyncio.create_task(
-                run_news_weather_agent(session, interval_holder)
-            )
-            input_task = asyncio.create_task(
-                user_input_loop(interval_holder)
-            )
-
-            # ждём, пока обе задачи не завершатся (по сути до Ctrl+C)
-            await asyncio.gather(agent_task, input_task)
+            # Запускаем агента с фиксированным интервалом
+            await run_news_weather_agent_fixed_interval(session, interval_seconds)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_async())
-    except RuntimeError as e:
-        print(f"Fatal error: {e}", file=sys.stderr)
-        sys.exit(1)
     except KeyboardInterrupt:
-        print("\nStopped by user.", file=sys.stderr)
-        sys.exit(0)
+        print("\nStopped by user.")
+    except RuntimeError as e:
+        print(f"\nFatal error: {e}")
+        sys.exit(1)
