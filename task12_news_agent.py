@@ -11,7 +11,7 @@ import sys
 import json
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import requests
 
@@ -24,8 +24,8 @@ YAC_MODEL = "yandexgpt"  # or your preferred model
 # Path to your MCP server file
 NEWS_WEATHER_SERVER_PATH = "news_weather_mcp_server.py"
 
-# How often to generate summary (minutes)
-SUMMARY_INTERVAL_MINUTES = 30
+# DEFAULT interval (seconds)
+SUMMARY_INTERVAL_SECONDS_DEFAULT = 30 * 60  # 30 минут
 
 # Where to store summaries (our "reminder log")
 SUMMARY_LOG_PATH = "news_weather_summaries.jsonl"
@@ -181,24 +181,32 @@ def append_summary_to_file(
         f.write("\n")
 
 
-async def run_news_weather_agent(session: ClientSession):
+async def run_news_weather_agent(
+    session: ClientSession,
+    interval_holder: Dict[str, int],
+):
     """
     Infinite loop:
-    - every N minutes:
+    - every interval_holder["seconds"]:
       - call MCP tool get_news_and_weather
       - send JSON to Yandex for summarization
       - print and log summary
     """
-    interval_seconds = SUMMARY_INTERVAL_MINUTES * 60
-
     print("=== Day 12 – News + Weather Agent (YandexGPT + MCP) ===")
-    print(f"Summary interval: {SUMMARY_INTERVAL_MINUTES} minutes")
+    print(
+        f"Initial summary interval: {interval_holder['seconds']} seconds "
+        f"({interval_holder['seconds'] // 60} minutes)"
+    )
     print("Press Ctrl+C to stop.\n")
 
     while True:
+        # читаем текущий интервал на начало итерации
+        interval_seconds = interval_holder["seconds"]
+
         started_at = datetime.now()
         print(
-            f"[{started_at.isoformat()}] Fetching news+weather via MCP tool...",
+            f"[{started_at.isoformat()}] Fetching news+weather via MCP tool..."
+            f" (interval now = {interval_seconds} s)",
             flush=True,
         )
 
@@ -227,7 +235,11 @@ async def run_news_weather_agent(session: ClientSession):
 
         # If tool returned error, just log and wait
         if "error" in data:
-            print(f"[Tool error] {data['error']}", flush=True)
+            print(
+                f"[Tool error] {data.get('error') or '(empty error message)'}",
+                flush=True,
+            )
+            # если пришёл traceback — будет видно в JSON
             await asyncio.sleep(interval_seconds)
             continue
 
@@ -258,8 +270,57 @@ async def run_news_weather_agent(session: ClientSession):
         # 5) Save summary to JSONL file (our "reminder log")
         append_summary_to_file(started_at, data, summary_text, token_info)
 
-        # 6) Wait until next tick
+        # 6) Wait until next tick (интервал может уже поменяться,
+        #    но мы используем тот, что был в начале этой итерации)
         await asyncio.sleep(interval_seconds)
+
+
+async def user_input_loop(interval_holder: Dict[str, int]):
+    """
+    Отдельная корутина, которая позволяет менять интервал "на лету" через консоль.
+
+    Формат:
+      - вводим число (в секундах) и жмём Enter → интервал меняется.
+      - пустая строка → игнорируем.
+    """
+    print(
+        "=== Interval control ===\n"
+        "В любой момент можете ввести новое значение интервала в СЕКУНДАХ и нажать Enter.\n"
+        "Например: 120   (это 2 минуты)\n"
+        "Текущий интервал хранится в interval_holder['seconds'].\n"
+    )
+
+    loop = asyncio.get_running_loop()
+
+    while True:
+        # input() блокирующий, поэтому гоняем его в отдельном потоке
+        try:
+            line = await asyncio.to_thread(input, "New interval (seconds, empty = skip): ")
+        except (EOFError, KeyboardInterrupt):
+            # Просто выходим из этого лупа, агент продолжит работать до Ctrl+C
+            print("\n[Interval input loop stopped]", flush=True)
+            return
+
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            value = int(line)
+        except ValueError:
+            print("[Invalid input] Please enter an integer number of seconds.", flush=True)
+            continue
+
+        if value <= 0:
+            print("[Invalid input] Interval must be > 0.", flush=True)
+            continue
+
+        interval_holder["seconds"] = value
+        print(
+            f"[Interval updated] New interval: {value} seconds "
+            f"({value // 60} minutes)",
+            flush=True,
+        )
 
 
 async def main_async():
@@ -273,6 +334,11 @@ async def main_async():
         env=None,
     )
 
+    # общий "контейнер" для интервала, чтобы две корутины могли его менять/читать
+    interval_holder: Dict[str, int] = {
+        "seconds": SUMMARY_INTERVAL_SECONDS_DEFAULT,
+    }
+
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -282,7 +348,18 @@ async def main_async():
             tool_names = [t.name for t in tools.tools]
             print(f"Connected to MCP news+weather server. Tools: {tool_names}\n")
 
-            await run_news_weather_agent(session)
+            # запускаем две корутины параллельно:
+            # 1) сам агент (крутится в вечном цикле)
+            # 2) обработчик ввода пользователя для смены интервала
+            agent_task = asyncio.create_task(
+                run_news_weather_agent(session, interval_holder)
+            )
+            input_task = asyncio.create_task(
+                user_input_loop(interval_holder)
+            )
+
+            # ждём, пока обе задачи не завершатся (по сути до Ctrl+C)
+            await asyncio.gather(agent_task, input_task)
 
 
 if __name__ == "__main__":

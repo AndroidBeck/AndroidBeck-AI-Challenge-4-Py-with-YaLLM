@@ -189,8 +189,10 @@ async def get_news_and_weather(
             file=sys.stderr,
             flush=True,
         )
+        message = str(e) or "Unknown error (see server stderr / traceback)"
         return {
-            "error": str(e),
+            "error": message,
+            "traceback": tb,
             "location": location,
             "country_code": country_code,
             "units": units,
