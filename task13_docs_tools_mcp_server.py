@@ -4,7 +4,7 @@ import glob
 import textwrap
 import requests
 
-from mcp.server.fastmcp import FastMCPServer
+from mcp.server.fastmcp import FastMCP
 
 # To run this:
 # pip install fastmcp mcp-client
@@ -14,34 +14,37 @@ from mcp.server.fastmcp import FastMCPServer
 
 
 # =========================
-# YandexGPT CONFIG
+# YandexGPT CONFIG (ленивая проверка)
 # =========================
 
 YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-YAC_FOLDER = os.getenv("YAC_FOLDER")
-YAC_API_KEY = os.getenv("YAC_API_KEY")
 
-if not YAC_FOLDER:
-    raise RuntimeError("YAC_FOLDER env var is not set")
-if not YAC_API_KEY:
-    raise RuntimeError("YAC_API_KEY env var is not set")
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": f"Api-Key {YAC_API_KEY}",
-}
+def _get_yandex_config():
+    folder = os.getenv("YAC_FOLDER")
+    api_key = os.getenv("YAC_API_KEY")
+    if not folder or not api_key:
+        raise RuntimeError(
+            "YandexGPT config is missing. "
+            "Please set YAC_FOLDER and YAC_API_KEY environment variables."
+        )
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Api-Key {api_key}",
+    }
+    return folder, headers
+
 
 # =========================
 # MCP SERVER
 # =========================
 
-server = FastMCPServer("docs-tools")
+mcp = FastMCP("docs-tools")
 
 
-def _load_docs_text(docs_dir: str) -> list[tuple[str, str]]:
-    """Return list of (path, text) for all .txt/.md files in docs_dir."""
+def _load_docs_text(docs_dir: str):
     patterns = ["*.txt", "*.md"]
-    results: list[tuple[str, str]] = []
+    results = []
 
     for pattern in patterns:
         for path in glob.glob(os.path.join(docs_dir, pattern)):
@@ -56,6 +59,8 @@ def _load_docs_text(docs_dir: str) -> list[tuple[str, str]]:
 
 
 def _call_yandex_summarize(text: str, max_tokens: int = 300) -> str:
+    folder, headers = _get_yandex_config()
+
     prompt = textwrap.dedent(
         f"""
         You are a helpful assistant that summarizes documents.
@@ -69,7 +74,7 @@ def _call_yandex_summarize(text: str, max_tokens: int = 300) -> str:
     )
 
     body = {
-        "modelUri": f"gpt://{YAC_FOLDER}/yandexgpt",
+        "modelUri": f"gpt://{folder}/yandexgpt",
         "completionOptions": {
             "stream": False,
             "temperature": 0.2,
@@ -81,7 +86,7 @@ def _call_yandex_summarize(text: str, max_tokens: int = 300) -> str:
         ],
     }
 
-    resp = requests.post(YAGPT_URL, headers=HEADERS, data=json.dumps(body))
+    resp = requests.post(YAGPT_URL, headers=headers, data=json.dumps(body))
     resp.raise_for_status()
     data = resp.json()
 
@@ -93,48 +98,33 @@ def _call_yandex_summarize(text: str, max_tokens: int = 300) -> str:
     return text.strip()
 
 
-@server.tool()
+@mcp.tool
 def search_docs(query: str, docs_dir: str = "docs") -> dict:
     """
     Search local docs for the query.
 
-    Args:
-        query: text to search for
-        docs_dir: path to directory with .txt/.md docs
-
     Returns:
-        {
-          "matches": [
-            {"path": "...", "snippet": "..."},
-            ...
-          ]
-        }
+        {"matches": [{"path": "...", "snippet": "..."}, ...]}
     """
     all_docs = _load_docs_text(docs_dir)
     q = query.lower()
 
-    matches: list[dict] = []
+    matches = []
     for path, text in all_docs:
         if q in text.lower():
-            # take first occurrence and build a small snippet
             idx = text.lower().index(q)
             start = max(0, idx - 200)
             end = min(len(text), idx + 200)
             snippet = text[start:end].replace("\n", " ")
             matches.append({"path": path, "snippet": snippet})
 
-    # If nothing found, we still return empty list
     return {"matches": matches}
 
 
-@server.tool()
+@mcp.tool
 def summarize_text(text: str, max_tokens: int = 300) -> dict:
     """
     Summarize text via YandexGPT (inside MCP tool).
-
-    Args:
-        text: long text to summarize
-        max_tokens: approximate size of summary
 
     Returns:
         {"summary": "..."}
@@ -146,7 +136,7 @@ def summarize_text(text: str, max_tokens: int = 300) -> dict:
     return {"summary": summary}
 
 
-@server.tool()
+@mcp.tool
 def save_to_file(
     content: str,
     filename: str = "summary.txt",
@@ -156,14 +146,8 @@ def save_to_file(
     """
     Save content to file.
 
-    Args:
-        content: text to write
-        filename: name of file
-        directory: folder to store file
-        mode: "append" or "overwrite"
-
     Returns:
-        {"path": "<absolute path>"}
+        {"path": "<absolute-path>"}
     """
     if not content:
         raise ValueError("content is empty, nothing to save")
@@ -181,5 +165,5 @@ def save_to_file(
 
 
 if __name__ == "__main__":
-    # Run MCP server (stdio)
-    server.run()
+    # Запускаем MCP-сервер по stdio
+    mcp.run()
