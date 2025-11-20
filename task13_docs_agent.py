@@ -2,57 +2,62 @@ import asyncio
 import datetime
 from typing import Any, Dict
 
-from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.session import ClientSession
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
 
 
 # ---------- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ВЫЗОВА ТУЛОВ ----------
 
-async def call_tool(
+async def call_tool_structured(
     session: ClientSession,
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Any:
     """
-    Вызов MCP-тула по имени с JSON-аргументами.
-    Возвращает распарсенный результат (dict или строку).
+    Вызов MCP-тула и возврат structuredContent (dict / список / примитив).
+
+    Если structuredContent нет, пытаемся достать текст из content.
     """
-    tool_list = await session.list_tools()
-    names = [t.name for t in tool_list.tools]
-    if tool_name not in names:
-        raise RuntimeError(f"Tool {tool_name!r} not found. Available: {names}")
+    # Сначала убеждаемся, что тул вообще есть
+    tools = await session.list_tools()
+    tool_names = [t.name for t in tools.tools]
+    if tool_name not in tool_names:
+        raise RuntimeError(f"Tool {tool_name!r} not found. Available: {tool_names}")
 
     result = await session.call_tool(tool_name, arguments)
 
+    # 1) Предпочитаем structuredContent — для наших тулов с return type dict
+    if hasattr(result, "structuredContent") and result.structuredContent is not None:
+        return result.structuredContent
+
+    # 2) Если structuredContent нет — пробуем разобрать content как текст / json
     if not result.content:
         return None
 
-    item = result.content[0]
+    # Ищем текстовый контент
+    for content in result.content:
+        if isinstance(content, types.TextContent):
+            return content.text
 
-    # JsonContent обычно имеет .data
-    if hasattr(item, "data"):
-        return item.data
-    # TextContent — .text
-    if hasattr(item, "text"):
-        return item.text
-
-    return None
+    # Если вдруг json-подобное (EmbeddedResource и т.п.) — просто вернём «как есть»
+    return [c for c in result.content]
 
 
 # ---------- ОСНОВНОЙ PIPELINE ----------
 
 async def pipeline_search_summarize_save(query: str) -> None:
     """
-    Открывает MCP-сервер через stdio и выполняет pipeline:
+    Подключается к MCP-серверу и выполняет пайплайн:
     search_docs -> summarize_text -> save_to_file
     """
-    params = StdioServerParameters(
+    server_params = StdioServerParameters(
         command="python",
-        args=["task13_docs_tools_mcp_server.py"],  # имя твоего сервера
+        args=["task13_docs_tools_mcp_server.py"],
     )
 
-    # Открываем stdio-клиент и сессию
-    async with stdio_client(params) as (read, write):
+    # stdio-клиент создаёт read/write потоки
+    async with stdio_client(server_params) as (read, write):
+        # ClientSession поверх этих потоков
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -60,11 +65,13 @@ async def pipeline_search_summarize_save(query: str) -> None:
 
             # 1) search_docs
             print("[1] Calling search_docs...")
-            search_result = await call_tool(
+            search_result = await call_tool_structured(
                 session,
                 "search_docs",
                 {"query": query, "docs_dir": "docs"},
             )
+
+            # search_docs возвращает dict {"matches": [...]}
             matches = (search_result or {}).get("matches", [])
             print(f"    Found {len(matches)} matches")
 
@@ -72,7 +79,7 @@ async def pipeline_search_summarize_save(query: str) -> None:
                 print("No matches found, nothing to summarize.")
                 return
 
-            # Склеиваем сниппеты в один текст
+            # Склеиваем snippets в один текст
             combined_text = "\n\n".join(
                 f"File: {m['path']}\nSnippet: {m['snippet']}"
                 for m in matches
@@ -80,7 +87,7 @@ async def pipeline_search_summarize_save(query: str) -> None:
 
             # 2) summarize_text
             print("[2] Calling summarize_text...")
-            summarize_result = await call_tool(
+            summarize_result = await call_tool_structured(
                 session,
                 "summarize_text",
                 {
@@ -88,6 +95,7 @@ async def pipeline_search_summarize_save(query: str) -> None:
                     "max_tokens": 300,
                 },
             )
+
             summary = (summarize_result or {}).get("summary", "").strip()
 
             if not summary:
@@ -102,7 +110,7 @@ async def pipeline_search_summarize_save(query: str) -> None:
             filename = f"summary_{timestamp}.txt"
 
             print("\n[3] Calling save_to_file...")
-            save_result = await call_tool(
+            save_result = await call_tool_structured(
                 session,
                 "save_to_file",
                 {
@@ -134,6 +142,7 @@ def main():
             print("Bye.")
             break
 
+        # каждая команда — отдельный запуск пайплайна
         asyncio.run(pipeline_search_summarize_save(query))
 
 
