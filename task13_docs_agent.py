@@ -1,6 +1,7 @@
 import asyncio
 import datetime
-from typing import Any, Dict
+import json
+from typing import Any, Dict, Tuple
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
@@ -8,17 +9,16 @@ from mcp.client.stdio import stdio_client
 
 # ---------- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ВЫЗОВА ТУЛОВ ----------
 
-async def call_tool_structured(
+async def call_tool_json_or_text(
     session: ClientSession,
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Any:
     """
-    Вызов MCP-тула и возврат structuredContent (dict / список / примитив).
-
-    Если structuredContent нет, пытаемся достать текст из content.
+    Вызов MCP-тула и попытка вернуть dict (если текст – JSON),
+    иначе обычную строку.
     """
-    # Сначала убеждаемся, что тул вообще есть
+    # Проверим, что тул существует
     tools = await session.list_tools()
     tool_names = [t.name for t in tools.tools]
     if tool_name not in tool_names:
@@ -26,21 +26,36 @@ async def call_tool_structured(
 
     result = await session.call_tool(tool_name, arguments)
 
-    # 1) Предпочитаем structuredContent — для наших тулов с return type dict
-    if hasattr(result, "structuredContent") and result.structuredContent is not None:
+    # Если вдруг есть structuredContent и он не None — вернём его
+    if getattr(result, "structuredContent", None) is not None:
         return result.structuredContent
 
-    # 2) Если structuredContent нет — пробуем разобрать content как текст / json
+    # Иначе забираем первый текстовый контент
     if not result.content:
         return None
 
-    # Ищем текстовый контент
+    text_value = None
+
     for content in result.content:
         if isinstance(content, types.TextContent):
-            return content.text
+            text_value = content.text
+            break
 
-    # Если вдруг json-подобное (EmbeddedResource и т.п.) — просто вернём «как есть»
-    return [c for c in result.content]
+    if text_value is None:
+        # нет текстового контента — вернём всё как есть (редкий случай)
+        return [c for c in result.content]
+
+    # Пытаемся распарсить как JSON
+    text_value = text_value.strip()
+    if text_value.startswith("{") or text_value.startswith("["):
+        try:
+            return json.loads(text_value)
+        except Exception:
+            # не получилось — вернём текст как есть
+            return text_value
+
+    # Не похоже на JSON — просто текст
+    return text_value
 
 
 # ---------- ОСНОВНОЙ PIPELINE ----------
@@ -55,9 +70,7 @@ async def pipeline_search_summarize_save(query: str) -> None:
         args=["task13_docs_tools_mcp_server.py"],
     )
 
-    # stdio-клиент создаёт read/write потоки
     async with stdio_client(server_params) as (read, write):
-        # ClientSession поверх этих потоков
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -65,21 +78,27 @@ async def pipeline_search_summarize_save(query: str) -> None:
 
             # 1) search_docs
             print("[1] Calling search_docs...")
-            search_result = await call_tool_structured(
+            search_result = await call_tool_json_or_text(
                 session,
                 "search_docs",
                 {"query": query, "docs_dir": "docs"},
             )
 
-            # search_docs возвращает dict {"matches": [...]}
-            matches = (search_result or {}).get("matches", [])
+            # search_result может быть dict ИЛИ текстом
+            if isinstance(search_result, str):
+                print("search_docs returned plain text, not JSON. Raw value:")
+                print(search_result)
+                print("Treating this as 'no matches'.")
+                matches = []
+            else:
+                matches = (search_result or {}).get("matches", [])
+
             print(f"    Found {len(matches)} matches")
 
             if not matches:
                 print("No matches found, nothing to summarize.")
                 return
 
-            # Склеиваем snippets в один текст
             combined_text = "\n\n".join(
                 f"File: {m['path']}\nSnippet: {m['snippet']}"
                 for m in matches
@@ -87,7 +106,7 @@ async def pipeline_search_summarize_save(query: str) -> None:
 
             # 2) summarize_text
             print("[2] Calling summarize_text...")
-            summarize_result = await call_tool_structured(
+            summarize_result = await call_tool_json_or_text(
                 session,
                 "summarize_text",
                 {
@@ -96,7 +115,12 @@ async def pipeline_search_summarize_save(query: str) -> None:
                 },
             )
 
-            summary = (summarize_result or {}).get("summary", "").strip()
+            # summarize_result тоже может быть dict или строкой
+            if isinstance(summarize_result, str):
+                # допустим, тул выдал чистый текст — тогда это уже summary
+                summary = summarize_result.strip()
+            else:
+                summary = (summarize_result or {}).get("summary", "").strip()
 
             if not summary:
                 print("Empty summary returned, nothing to save.")
@@ -110,7 +134,7 @@ async def pipeline_search_summarize_save(query: str) -> None:
             filename = f"summary_{timestamp}.txt"
 
             print("\n[3] Calling save_to_file...")
-            save_result = await call_tool_structured(
+            save_result = await call_tool_json_or_text(
                 session,
                 "save_to_file",
                 {
@@ -121,7 +145,13 @@ async def pipeline_search_summarize_save(query: str) -> None:
                 },
             )
 
-            saved_path = (save_result or {}).get("path")
+            if isinstance(save_result, str):
+                print("save_to_file returned plain text:")
+                print(save_result)
+                saved_path = None
+            else:
+                saved_path = (save_result or {}).get("path")
+
             print(f"\nSummary saved to: {saved_path}")
 
 
@@ -142,7 +172,6 @@ def main():
             print("Bye.")
             break
 
-        # каждая команда — отдельный запуск пайплайна
         asyncio.run(pipeline_search_summarize_save(query))
 
 

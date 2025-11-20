@@ -11,6 +11,9 @@ import textwrap
 import requests
 
 from mcp.server.fastmcp import FastMCP
+from dotenv import load_dotenv
+
+load_dotenv()  # <-- вот это важно
 
 # =========================
 # YandexGPT CONFIG (ленивая проверка)

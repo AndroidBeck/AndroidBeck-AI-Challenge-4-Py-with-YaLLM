@@ -1,0 +1,13 @@
+/.env
+*.db
+*.sqbpro
+/summaries/*
+/news_weather_summaries.jsonl
+
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/.gitignore
+/.idea/vcs.xml
+
+/notebook.ipynb
+/PyCharmMiscProject.iml
