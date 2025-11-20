@@ -1,29 +1,12 @@
 import asyncio
 import datetime
-import json
-import os
 from typing import Any, Dict
 
-from mcp.client.stdio import StdioServerParameters
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.session import ClientSession
 
 
-# ---------- MCP CONNECTION ----------
-
-async def connect_to_docs_server() -> ClientSession:
-    """
-    Connects to docs-tools MCP server via stdio.
-    Adjust the command/path if your server filename is different.
-    """
-    params = StdioServerParameters(
-        command="python",
-        args=["task13_docs_tools_mcp_server.py"],
-    )
-
-    session = ClientSession(params)
-    await session.__aenter__()  # manual "async with"
-    return session
-
+# ---------- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ВЫЗОВА ТУЛОВ ----------
 
 async def call_tool(
     session: ClientSession,
@@ -31,8 +14,8 @@ async def call_tool(
     arguments: Dict[str, Any],
 ) -> Any:
     """
-    Helper to call any MCP tool by name with JSON arguments.
-    Returns parsed result.
+    Вызов MCP-тула по имени с JSON-аргументами.
+    Возвращает распарсенный результат (dict или строку).
     """
     tool_list = await session.list_tools()
     names = [t.name for t in tool_list.tools]
@@ -41,89 +24,100 @@ async def call_tool(
 
     result = await session.call_tool(tool_name, arguments)
 
-    # result.content is a list of Content objects (text/json)
-    # We expect first item, JSON.
     if not result.content:
         return None
 
     item = result.content[0]
-    if getattr(item, "type", "") == "json":
+
+    # JsonContent обычно имеет .data
+    if hasattr(item, "data"):
         return item.data
-    else:
-        # fallback: if it's text, just return text
-        return getattr(item, "text", None)
+    # TextContent — .text
+    if hasattr(item, "text"):
+        return item.text
+
+    return None
 
 
-# ---------- PIPELINE STEPS ----------
+# ---------- ОСНОВНОЙ PIPELINE ----------
 
 async def pipeline_search_summarize_save(query: str) -> None:
-    session = await connect_to_docs_server()
-    try:
-        print(f"\n=== Connecting pipeline for query: {query!r} ===")
+    """
+    Открывает MCP-сервер через stdio и выполняет pipeline:
+    search_docs -> summarize_text -> save_to_file
+    """
+    params = StdioServerParameters(
+        command="python",
+        args=["task13_docs_tools_mcp_server.py"],  # имя твоего сервера
+    )
 
-        # 1) search_docs
-        print("[1] Calling search_docs...")
-        search_result = await call_tool(
-            session,
-            "search_docs",
-            {"query": query, "docs_dir": "docs"},
-        )
-        matches = (search_result or {}).get("matches", [])
-        print(f"    Found {len(matches)} matches")
+    # Открываем stdio-клиент и сессию
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
 
-        if not matches:
-            print("No matches found, nothing to summarize.")
-            return
+            print(f"\n=== Connecting pipeline for query: {query!r} ===")
 
-        # Combine snippets into one text
-        combined_text = "\n\n".join(
-            f"File: {m['path']}\nSnippet: {m['snippet']}"
-            for m in matches
-        )
+            # 1) search_docs
+            print("[1] Calling search_docs...")
+            search_result = await call_tool(
+                session,
+                "search_docs",
+                {"query": query, "docs_dir": "docs"},
+            )
+            matches = (search_result or {}).get("matches", [])
+            print(f"    Found {len(matches)} matches")
 
-        # 2) summarize_text
-        print("[2] Calling summarize_text...")
-        summarize_result = await call_tool(
-            session,
-            "summarize_text",
-            {
-                "text": combined_text,
-                "max_tokens": 300,
-            },
-        )
-        summary = (summarize_result or {}).get("summary", "").strip()
+            if not matches:
+                print("No matches found, nothing to summarize.")
+                return
 
-        if not summary:
-            print("Empty summary returned, nothing to save.")
-            return
+            # Склеиваем сниппеты в один текст
+            combined_text = "\n\n".join(
+                f"File: {m['path']}\nSnippet: {m['snippet']}"
+                for m in matches
+            )
 
-        print("\n=== Summary ===")
-        print(summary)
+            # 2) summarize_text
+            print("[2] Calling summarize_text...")
+            summarize_result = await call_tool(
+                session,
+                "summarize_text",
+                {
+                    "text": combined_text,
+                    "max_tokens": 300,
+                },
+            )
+            summary = (summarize_result or {}).get("summary", "").strip()
 
-        # 3) save_to_file
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"summary_{timestamp}.txt"
+            if not summary:
+                print("Empty summary returned, nothing to save.")
+                return
 
-        print("\n[3] Calling save_to_file...")
-        save_result = await call_tool(
-            session,
-            "save_to_file",
-            {
-                "content": summary,
-                "filename": filename,
-                "directory": "summaries",
-                "mode": "append",
-            },
-        )
+            print("\n=== Summary ===")
+            print(summary)
 
-        saved_path = (save_result or {}).get("path")
-        print(f"\nSummary saved to: {saved_path}")
+            # 3) save_to_file
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"summary_{timestamp}.txt"
 
-    finally:
-        await session.__aexit__(None, None, None)
+            print("\n[3] Calling save_to_file...")
+            save_result = await call_tool(
+                session,
+                "save_to_file",
+                {
+                    "content": summary,
+                    "filename": filename,
+                    "directory": "summaries",
+                    "mode": "append",
+                },
+            )
+
+            saved_path = (save_result or {}).get("path")
+            print(f"\nSummary saved to: {saved_path}")
 
 
-# ---------- CLI LOOP ----------
+# ---------- CLI ----------
 
 def main():
     print("=== Day 13 – MCP tools composition (search → summarize → save) ===")
