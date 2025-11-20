@@ -1,0 +1,1 @@
+This is a sample document about OpenAI and the MCP protocol. Today we test pipelines.
