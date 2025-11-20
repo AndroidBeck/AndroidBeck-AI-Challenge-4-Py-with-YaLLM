@@ -1,3 +1,9 @@
+# To run this:
+# pip install fastmcp mcp-client
+# pip install requests
+# Put at least one file into docs/, e.g. docs/doc1.txt
+# python task13_docs_agent.py
+
 import os
 import json
 import glob
@@ -5,13 +11,6 @@ import textwrap
 import requests
 
 from mcp.server.fastmcp import FastMCP
-
-# To run this:
-# pip install fastmcp mcp-client
-# pip install requests
-# Put at least one file into docs/, e.g. docs/doc1.txt
-# python task13_docs_agent.py
-
 
 # =========================
 # YandexGPT CONFIG (ленивая проверка)
@@ -98,13 +97,10 @@ def _call_yandex_summarize(text: str, max_tokens: int = 300) -> str:
     return text.strip()
 
 
-@mcp.tool
+@mcp.tool()
 def search_docs(query: str, docs_dir: str = "docs") -> dict:
     """
     Search local docs for the query.
-
-    Returns:
-        {"matches": [{"path": "...", "snippet": "..."}, ...]}
     """
     all_docs = _load_docs_text(docs_dir)
     q = query.lower()
@@ -121,13 +117,10 @@ def search_docs(query: str, docs_dir: str = "docs") -> dict:
     return {"matches": matches}
 
 
-@mcp.tool
+@mcp.tool()
 def summarize_text(text: str, max_tokens: int = 300) -> dict:
     """
-    Summarize text via YandexGPT (inside MCP tool).
-
-    Returns:
-        {"summary": "..."}
+    Summarize text via YandexGPT.
     """
     if not text.strip():
         return {"summary": ""}
@@ -136,7 +129,7 @@ def summarize_text(text: str, max_tokens: int = 300) -> dict:
     return {"summary": summary}
 
 
-@mcp.tool
+@mcp.tool()
 def save_to_file(
     content: str,
     filename: str = "summary.txt",
@@ -145,9 +138,6 @@ def save_to_file(
 ) -> dict:
     """
     Save content to file.
-
-    Returns:
-        {"path": "<absolute-path>"}
     """
     if not content:
         raise ValueError("content is empty, nothing to save")
@@ -165,5 +155,4 @@ def save_to_file(
 
 
 if __name__ == "__main__":
-    # Запускаем MCP-сервер по stdio
     mcp.run()
