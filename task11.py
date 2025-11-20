@@ -13,7 +13,7 @@ YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 YAC_MODEL = "yandexgpt"  # or your preferred model
 
 # Path to your weather MCP server file
-WEATHER_SERVER_PATH = "weather_mcp_server.py"
+WEATHER_SERVER_PATH = "task11_weather_mcp_server.py"
 
 
 def get_env_or_die(name: str) -> str:
@@ -321,7 +321,7 @@ If something is missing in the tool output, say that you don't know.
 async def main_async():
     """
     Connect to the weather MCP server over stdio and run the chat loop.
-    This will spawn `python weather_mcp_server.py` as a child process.
+    This will spawn `python task11_weather_mcp_server.py` as a child process.
     """
     server_params = StdioServerParameters(
         command="python",

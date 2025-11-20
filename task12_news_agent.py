@@ -21,7 +21,7 @@ YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 YAC_MODEL = "yandexgpt"  # или другой, если хочешь
 
 # Путь к MCP-серверу
-NEWS_WEATHER_SERVER_PATH = "news_weather_mcp_server.py"
+NEWS_WEATHER_SERVER_PATH = "task12_news_weather_mcp_server.py"
 
 # Лог с саммари (JSONL)
 SUMMARY_LOG_PATH = "news_weather_summaries.jsonl"
