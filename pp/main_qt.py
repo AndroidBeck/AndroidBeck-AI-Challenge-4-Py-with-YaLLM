@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QLabel,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread
 
 from db import (
     init_db,
@@ -37,6 +37,65 @@ def select_or_create_conversation() -> int:
     return conversation_id
 
 
+# =========================
+# WORKERS (фоновая работа в QThread)
+# =========================
+
+class ChatWorker(QObject):
+    finished = Signal(object, object, int, object)  # reply_text, usage, messages_sent, error_msg
+
+    def __init__(self, conversation_id: int, user_text: str, model_name: str):
+        super().__init__()
+        self.conversation_id = conversation_id
+        self.user_text = user_text
+        self.model_name = model_name
+
+    @Slot()
+    def run(self):
+        try:
+            reply_text, usage, messages_sent = chat_turn(
+                self.conversation_id,
+                self.user_text,
+                self.model_name,
+            )
+            error_msg = None
+        except Exception as e:
+            # На всякий случай ловим всё, но основная ошибка уже печатается в chat_turn
+            reply_text, usage, messages_sent = None, {}, 0
+            error_msg = str(e)
+
+        self.finished.emit(reply_text, usage, messages_sent, error_msg)
+
+
+class SummaryWorker(QObject):
+    finished = Signal(object, object, int, object)  # summary_text, usage, messages_sent, error_msg
+
+    def __init__(self, conversation_id: int, max_tokens: int, model_name: str):
+        super().__init__()
+        self.conversation_id = conversation_id
+        self.max_tokens = max_tokens
+        self.model_name = model_name
+
+    @Slot()
+    def run(self):
+        try:
+            summary_text, usage, messages_sent = summarize_conversation_core(
+                self.conversation_id,
+                self.max_tokens,
+                self.model_name,
+            )
+            error_msg = None
+        except Exception as e:
+            summary_text, usage, messages_sent = None, {}, 0
+            error_msg = str(e)
+
+        self.finished.emit(summary_text, usage, messages_sent, error_msg)
+
+
+# =========================
+# MAIN WINDOW
+# =========================
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -50,6 +109,10 @@ class MainWindow(QMainWindow):
 
         # current model
         self.current_model_name = get_default_model_name()
+
+        # Хранители текущих потоков, чтобы их не схлопнул GC
+        self.current_thread = None
+        self.current_worker = None
 
         # === Widgets ===
         central = QWidget()
@@ -76,12 +139,10 @@ class MainWindow(QMainWindow):
         top_controls.addWidget(QLabel("Model:"))
         top_controls.addWidget(self.model_combo)
 
-        # Кнопка summarize
         self.summary_button = QPushButton("Summarize (400 tokens)")
         self.summary_button.clicked.connect(self.on_summarize_clicked)
         top_controls.addWidget(self.summary_button)
 
-        # Кнопка new conversation
         self.new_button = QPushButton("New conversation")
         self.new_button.clicked.connect(self.on_new_conversation_clicked)
         top_controls.addWidget(self.new_button)
@@ -91,7 +152,10 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(bottom_layout)
 
         self.input_edit = QTextEdit()
-        self.input_edit.setPlaceholderText("Type your message (Ctrl+Enter for newline, Enter to send — пока просто кнопкой)...")
+        self.input_edit.setPlaceholderText(
+            "Type your message here...\n"
+            "(Shift+Enter для новой строки, Enter по кнопке \"Send\")"
+        )
         self.input_edit.setFixedHeight(100)
         bottom_layout.addWidget(self.input_edit)
 
@@ -109,7 +173,7 @@ class MainWindow(QMainWindow):
             "Commands supported here:\n"
             "  /summarize X, /sum X, /compress X  – summarize active messages\n"
             "  /deactivate                         – deactivate all messages in this conversation\n"
-            "You can also use buttons above."
+            "You can also use the buttons above."
         )
 
     # ====== helpers ======
@@ -121,9 +185,26 @@ class MainWindow(QMainWindow):
         self.history_view.append(f"<b>YOU:</b> {text}")
 
     def append_assistant_text(self, text: str) -> None:
-        # Простой вывод, без markdown
-        # Можно улучшить позже: подсветка, разделители и т.д.
         self.history_view.append(f"<b>ASSISTANT:</b>\n{text}")
+
+    def set_busy(self, busy: bool, message: str = "") -> None:
+        self.send_button.setEnabled(not busy)
+        self.summary_button.setEnabled(not busy)
+        self.new_button.setEnabled(not busy)
+        self.model_combo.setEnabled(not busy)
+        if busy:
+            self.status_label.setText(message or "Working...")
+        else:
+            if not message:
+                message = "Ready."
+            self.status_label.setText(message)
+
+    def cleanup_thread(self):
+        if self.current_thread is not None:
+            self.current_thread.quit()
+            self.current_thread.wait()
+            self.current_thread = None
+        self.current_worker = None
 
     # ====== slots ======
 
@@ -140,18 +221,42 @@ class MainWindow(QMainWindow):
 
     def on_summarize_clicked(self) -> None:
         max_tokens = 400
-        summary_text, usage, messages_sent = summarize_conversation_core(
-            self.conversation_id,
-            max_tokens,
-            self.current_model_name,
-        )
+        # Запускаем summary в отдельном потоке
+        self.set_busy(True, "Summarizing...")
+
+        thread = QThread()
+        worker = SummaryWorker(self.conversation_id, max_tokens, self.current_model_name)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.on_summary_finished)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self.current_thread = thread
+        self.current_worker = worker
+
+        thread.start()
+
+    @Slot(object, object, int, object)
+    def on_summary_finished(self, summary_text, usage, messages_sent, error_msg):
+        self.set_busy(False)
+
         if messages_sent == 0:
             self.status_label.setText("Nothing to summarize: no active messages.")
+            self.cleanup_thread()
+            return
+
+        if error_msg is not None:
+            self.append_system_text("[ERROR] Summarization failed (see console).")
+            self.status_label.setText("Summarization failed (see console).")
+            self.cleanup_thread()
             return
 
         if summary_text is None:
-            self.status_label.setText("Summarization failed (see console for details).")
             self.append_system_text("[ERROR] Summarization failed.")
+            self.status_label.setText("Summarization failed.")
+            self.cleanup_thread()
             return
 
         self.append_system_text("<b>SUMMARY:</b>")
@@ -163,6 +268,8 @@ class MainWindow(QMainWindow):
             f"total={usage.get('totalTokens')}, "
             f"messages_sent={messages_sent}"
         )
+
+        self.cleanup_thread()
 
     def on_send_clicked(self) -> None:
         text = self.input_edit.toPlainText().strip()
@@ -199,45 +306,57 @@ class MainWindow(QMainWindow):
             else:
                 max_tokens = 400
 
-            summary_text, usage, messages_sent = summarize_conversation_core(
-                self.conversation_id,
-                max_tokens,
-                self.current_model_name,
-            )
+            # запуск summarization через кнопку/команду
+            self.set_busy(True, "Summarizing...")
+            thread = QThread()
+            worker = SummaryWorker(self.conversation_id, max_tokens, self.current_model_name)
+            worker.moveToThread(thread)
 
-            if messages_sent == 0:
-                self.status_label.setText("Nothing to summarize: no active messages.")
-                return
+            thread.started.connect(worker.run)
+            worker.finished.connect(self.on_summary_finished)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
 
-            if summary_text is None:
-                self.status_label.setText("Summarization failed (see console).")
-                self.append_system_text("[ERROR] Summarization failed.")
-                return
+            self.current_thread = thread
+            self.current_worker = worker
 
-            self.append_system_text("<b>SUMMARY:</b>")
-            self.history_view.append(summary_text)
-
-            self.status_label.setText(
-                f"Summary done. input={usage.get('inputTextTokens')}, "
-                f"completion={usage.get('completionTokens')}, "
-                f"total={usage.get('totalTokens')}, "
-                f"messages_sent={messages_sent}"
-            )
+            thread.start()
             return
 
-        # Обычное сообщение
+        # Обычное сообщение → показываем сразу в истории
         self.append_user_text(text)
 
-        # Синхронный вызов LLM (UI может немного подфризить)
-        reply_text, usage, messages_sent = chat_turn(
-            self.conversation_id,
-            text,
-            self.current_model_name,
-        )
+        # Запускаем chat_turn в отдельном потоке
+        self.set_busy(True, "Thinking...")
+
+        thread = QThread()
+        worker = ChatWorker(self.conversation_id, text, self.current_model_name)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.on_chat_finished)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self.current_thread = thread
+        self.current_worker = worker
+
+        thread.start()
+
+    @Slot(object, object, int, object)
+    def on_chat_finished(self, reply_text, usage, messages_sent, error_msg):
+        self.set_busy(False)
+
+        if error_msg is not None:
+            self.append_system_text("[ERROR] LLM call failed (see console).")
+            self.status_label.setText("LLM call failed (see console).")
+            self.cleanup_thread()
+            return
 
         if reply_text is None:
-            self.append_system_text("[ERROR] LLM call failed (see console).")
-            self.status_label.setText("LLM call failed (see console for details).")
+            self.append_system_text("[ERROR] LLM call failed.")
+            self.status_label.setText("LLM call failed.")
+            self.cleanup_thread()
             return
 
         self.append_assistant_text(reply_text)
@@ -248,6 +367,8 @@ class MainWindow(QMainWindow):
             f"total={usage.get('totalTokens')}, "
             f"messages_sent={messages_sent}"
         )
+
+        self.cleanup_thread()
 
 
 def main():
