@@ -172,34 +172,49 @@ async def docs_search_and_summarize(
 
     return f"Could not parse summarize_text result: {summary_res!r}"
 
-
 async def docs_save_report(
     docs_session: ClientSession,
     report_text: str,
     topic: str,
 ) -> Optional[str]:
     """
-    Save final report via docs MCP save_to_file.
+    Save final report.
+
+    We do it in two steps:
+    1) Agent itself writes to summaries/summary_YYYYMMDD_HHMMSS.txt
+       (like in previous days).
+    2) Optionally call docs MCP save_to_file just to keep orchestration,
+       but we ignore its returned path.
+
+    The path we RETURN (and print) is the timestamped file created by the agent.
     """
-    today = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    slug = "".join(ch for ch in topic.lower().replace(" ", "_") if ch.isalnum() or ch == "_")
-    filename_hint = f"day14_report_{slug}_{today}"
+    # 1) Agent-side file write with timestamped filename
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    summaries_dir = os.path.join(base_dir, "summaries")
+    os.makedirs(summaries_dir, exist_ok=True)
 
-    print(f"[Docs] Saving report via save_to_file (filename_hint={filename_hint!r}) ...")
-    save_res = await call_tool(
-        docs_session,
-        "save_to_file",
-        {"content": report_text, "filename_hint": filename_hint},
-    )
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"summary_{timestamp}.txt"
+    local_path = os.path.join(summaries_dir, filename)
 
-    if isinstance(save_res, dict):
-        path = save_res.get("path") or save_res.get("file_path") or save_res.get("filename")
-        return path
+    print(f"[Docs] Writing report locally to: {local_path!r}")
+    with open(local_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
 
-    if isinstance(save_res, str):
-        return save_res.strip()
+    # 2) Call docs MCP save_to_file as part of orchestration (optional, best-effort)
+    try:
+        print(f"[Docs] Also calling save_to_file via MCP (filename_hint={filename!r}) ...")
+        _ = await call_tool(
+            docs_session,
+            "save_to_file",
+            {"content": report_text, "filename_hint": filename},
+        )
+    except Exception as e:
+        # Log but do not fail the whole pipeline
+        print(f"[Docs] Warning: save_to_file via MCP failed: {e!r}")
 
-    return None
+    # We ALWAYS return the agent-created local_path
+    return local_path
 
 
 # -----------------------------
