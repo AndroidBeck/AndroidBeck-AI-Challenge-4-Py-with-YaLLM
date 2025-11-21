@@ -1,5 +1,4 @@
 import sys
-from typing import Optional
 
 from PySide6.QtWidgets import (
     QApplication,
@@ -8,7 +7,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QTextEdit,
-    QLineEdit,
     QPushButton,
     QComboBox,
     QLabel,
@@ -44,7 +42,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Personal AI Project – PySide6 UI")
-        self.resize(800, 600)
+        self.resize(900, 650)
 
         # DB + conversation
         init_db()
@@ -60,12 +58,12 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout()
         central.setLayout(main_layout)
 
-        # Chat history
+        # Chat history (read-only)
         self.history_view = QTextEdit()
         self.history_view.setReadOnly(True)
         main_layout.addWidget(self.history_view)
 
-        # Model + summary line
+        # Top controls: model selector + summary + new conversation
         top_controls = QHBoxLayout()
         main_layout.addLayout(top_controls)
 
@@ -88,13 +86,13 @@ class MainWindow(QMainWindow):
         self.new_button.clicked.connect(self.on_new_conversation_clicked)
         top_controls.addWidget(self.new_button)
 
-        # Полоса ввода
+        # Bottom area: multiline input + send button
         bottom_layout = QHBoxLayout()
         main_layout.addLayout(bottom_layout)
 
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Type your message...")
-        self.input_edit.returnPressed.connect(self.on_send_clicked)
+        self.input_edit = QTextEdit()
+        self.input_edit.setPlaceholderText("Type your message (Ctrl+Enter for newline, Enter to send — пока просто кнопкой)...")
+        self.input_edit.setFixedHeight(100)
         bottom_layout.addWidget(self.input_edit)
 
         self.send_button = QPushButton("Send")
@@ -105,8 +103,14 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready.")
         main_layout.addWidget(self.status_label)
 
-        # Приветственное сообщение
+        # Welcome text
         self.append_system_text("Welcome to Personal AI Project (PySide6 UI).\n")
+        self.append_system_text(
+            "Commands supported here:\n"
+            "  /summarize X, /sum X, /compress X  – summarize active messages\n"
+            "  /deactivate                         – deactivate all messages in this conversation\n"
+            "You can also use buttons above."
+        )
 
     # ====== helpers ======
 
@@ -117,7 +121,8 @@ class MainWindow(QMainWindow):
         self.history_view.append(f"<b>YOU:</b> {text}")
 
     def append_assistant_text(self, text: str) -> None:
-        # Простой вариант, без markdown
+        # Простой вывод, без markdown
+        # Можно улучшить позже: подсветка, разделители и т.д.
         self.history_view.append(f"<b>ASSISTANT:</b>\n{text}")
 
     # ====== slots ======
@@ -140,8 +145,13 @@ class MainWindow(QMainWindow):
             max_tokens,
             self.current_model_name,
         )
+        if messages_sent == 0:
+            self.status_label.setText("Nothing to summarize: no active messages.")
+            return
+
         if summary_text is None:
-            self.status_label.setText("Summarization failed.")
+            self.status_label.setText("Summarization failed (see console for details).")
+            self.append_system_text("[ERROR] Summarization failed.")
             return
 
         self.append_system_text("<b>SUMMARY:</b>")
@@ -155,14 +165,16 @@ class MainWindow(QMainWindow):
         )
 
     def on_send_clicked(self) -> None:
-        text = self.input_edit.text().strip()
+        text = self.input_edit.toPlainText().strip()
         if not text:
             return
 
+        # Очищаем ввод
         self.input_edit.clear()
 
-        # Поддержим некоторые команды, как в CLI
         lower = text.lower()
+
+        # Обработка команд (как в CLI)
 
         if lower == "/deactivate":
             deactivate_all_messages_for_conversation(self.conversation_id)
@@ -172,7 +184,11 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Conversation messages deactivated.")
             return
 
-        if lower.startswith("/summarize") or lower.startswith("/compress") or lower.startswith("/sum"):
+        if (
+            lower.startswith("/summarize")
+            or lower.startswith("/compress")
+            or lower.startswith("/sum")
+        ):
             parts = text.split()
             if len(parts) >= 2:
                 try:
@@ -189,8 +205,13 @@ class MainWindow(QMainWindow):
                 self.current_model_name,
             )
 
+            if messages_sent == 0:
+                self.status_label.setText("Nothing to summarize: no active messages.")
+                return
+
             if summary_text is None:
-                self.status_label.setText("Summarization failed.")
+                self.status_label.setText("Summarization failed (see console).")
+                self.append_system_text("[ERROR] Summarization failed.")
                 return
 
             self.append_system_text("<b>SUMMARY:</b>")
@@ -207,7 +228,7 @@ class MainWindow(QMainWindow):
         # Обычное сообщение
         self.append_user_text(text)
 
-        # Важно: сейчас вызываем LLM синхронно → UI подфризит.
+        # Синхронный вызов LLM (UI может немного подфризить)
         reply_text, usage, messages_sent = chat_turn(
             self.conversation_id,
             text,
@@ -215,8 +236,8 @@ class MainWindow(QMainWindow):
         )
 
         if reply_text is None:
-            self.append_system_text("[ERROR] LLM call failed.")
-            self.status_label.setText("Error calling LLM.")
+            self.append_system_text("[ERROR] LLM call failed (see console).")
+            self.status_label.setText("LLM call failed (see console for details).")
             return
 
         self.append_assistant_text(reply_text)

@@ -78,8 +78,9 @@ def chat_turn(
             max_tokens=1500,
             model_name=model_name,
         )
-    except LlmError:
-        # Ошибку логируем/отображаем на более высоком уровне (UI/CLI)
+    except LlmError as e:
+        # Логируем текст ошибки в консоль (видно и при запуске GUI из консоли)
+        print(f"[LLM ERROR in chat_turn] {e}")
         return None, {}, len(messages_for_api)
 
     # Сохраняем ответ ассистента
@@ -131,7 +132,8 @@ def summarize_conversation_core(
             max_tokens=max_tokens_for_summary,
             model_name=model_name,
         )
-    except LlmError:
+    except LlmError as e:
+        print(f"[LLM ERROR in summarize_conversation_core] {e}")
         return None, {}, len(messages_for_api)
 
     # Архивируем все предыдущие не-summary сообщения
