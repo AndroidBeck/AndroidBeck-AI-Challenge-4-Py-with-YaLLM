@@ -28,7 +28,6 @@ import json
 import os
 import sys
 import textwrap
-from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -99,31 +98,6 @@ def call_yandex_report_model(prompt: str, model: str = "yandexgpt") -> str:
 # -----------------------------
 # MCP client helpers
 # -----------------------------
-
-async def open_mcp_session(
-    command: List[str],
-    stack: AsyncExitStack,
-) -> ClientSession:
-    """
-    Open a persistent MCP session to a given server command using stdio_client.
-
-    Example command: [sys.executable, "task13_docs_tools_mcp_server.py"]
-    """
-    server_params = StdioServerParameters(
-        command=command[0],
-        args=command[1:],
-        env=None,
-    )
-
-    # start server process and get (read, write) streams
-    stdio_transport = await stack.enter_async_context(stdio_client(server_params))
-    read, write = stdio_transport
-
-    # attach a ClientSession to the same stack
-    session = await stack.enter_async_context(ClientSession(read, write))
-    await session.initialize()
-    return session
-
 
 async def call_tool(
     session: ClientSession,
@@ -275,111 +249,118 @@ async def orchestrate(topic: str, city: str) -> None:
     """
     print("\n=== Day 14 – Orchestration (Docs + News + Weather) ===")
 
-    docs_cmd = [sys.executable, "task13_docs_tools_mcp_server.py"]
-    news_cmd = [sys.executable, "task14_news_weather_mcp_server.py"]
+    docs_params = StdioServerParameters(
+        command=sys.executable,
+        args=["task13_docs_tools_mcp_server.py"],
+    )
+    news_params = StdioServerParameters(
+        command=sys.executable,
+        args=["task14_news_weather_mcp_server.py"],
+    )
 
-    # use one AsyncExitStack to manage both MCP sessions
-    async with AsyncExitStack() as stack:
-        print("Opening MCP sessions...")
-        docs_session, news_session = await asyncio.gather(
-            open_mcp_session(docs_cmd, stack),
-            open_mcp_session(news_cmd, stack),
-        )
+    # NESTED contexts to avoid cancel-scope issues:
+    async with stdio_client(docs_params) as (docs_r, docs_w):
+        async with ClientSession(docs_r, docs_w) as docs_session:
+            await docs_session.initialize()
 
-        # 1) Docs: background
-        background_text = await docs_search_and_summarize(docs_session, topic)
+            async with stdio_client(news_params) as (news_r, news_w):
+                async with ClientSession(news_r, news_w) as news_session:
+                    await news_session.initialize()
 
-        # 2) News: latest headlines
-        news_data = await news_get_news(news_session, topic, language="en", page_size=5)
-        articles = news_data.get("articles") or []
-        news_section_lines: List[str] = []
-        if articles:
-            for idx, art in enumerate(articles, start=1):
-                line = f"{idx}. {art.get('title') or 'No title'}"
-                desc = art.get("description") or ""
-                if desc:
-                    line += f"\n   {desc}"
-                source = art.get("source") or ""
-                published = art.get("published_at") or ""
-                if source or published:
-                    line += f"\n   [{source} | {published}]"
-                news_section_lines.append(line)
-        else:
-            err = news_data.get("error")
-            if err:
-                news_section_lines.append(f"Error fetching news: {err}")
-            else:
-                news_section_lines.append("No news articles found or parsed.")
+                    # 1) Docs: background
+                    background_text = await docs_search_and_summarize(docs_session, topic)
 
-        news_section_text = "\n\n".join(news_section_lines)
+                    # 2) News: latest headlines
+                    news_data = await news_get_news(news_session, topic, language="en", page_size=5)
+                    articles = news_data.get("articles") or []
+                    news_section_lines: List[str] = []
+                    if articles:
+                        for idx, art in enumerate(articles, start=1):
+                            line = f"{idx}. {art.get('title') or 'No title'}"
+                            desc = art.get("description") or ""
+                            if desc:
+                                line += f"\n   {desc}"
+                            source = art.get("source") or ""
+                            published = art.get("published_at") or ""
+                            if source or published:
+                                line += f"\n   [{source} | {published}]"
+                            news_section_lines.append(line)
+                    else:
+                        err = news_data.get("error")
+                        if err:
+                            news_section_lines.append(f"Error fetching news: {err}")
+                        else:
+                            news_section_lines.append("No news articles found or parsed.")
 
-        # 3) Weather: optional
-        weather_section_text = ""
-        if city:
-            weather_data = await news_get_weather(news_session, city, units="metric")
-            if "error" in weather_data:
-                weather_section_text = f"Error fetching weather for {city}: {weather_data['error']}"
-            else:
-                cw = (weather_data.get("current_weather") or {})
-                loc = (weather_data.get("location") or {})
-                note = (loc.get("note") or "")
-                weather_section_text = (
-                    f"Location: {loc.get('resolved_name')}, {loc.get('country')} "
-                    f"({loc.get('latitude')}, {loc.get('longitude')})\n"
-                    f"Temperature: {cw.get('temperature')}°C\n"
-                    f"Wind: {cw.get('windspeed')} km/h, direction {cw.get('winddirection')}\n"
-                    f"Time: {cw.get('time')}"
-                )
-                if note:
-                    weather_section_text += f"\nNOTE: {note}"
+                    news_section_text = "\n\n".join(news_section_lines)
 
-        # 4) Build YandexGPT prompt
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        user_prompt = textwrap.dedent(
-            f"""
-            Create a structured report about the topic: "{topic}".
+                    # 3) Weather: optional
+                    weather_section_text = ""
+                    if city:
+                        weather_data = await news_get_weather(news_session, city, units="metric")
+                        if "error" in weather_data:
+                            weather_section_text = f"Error fetching weather for {city}: {weather_data['error']}"
+                        else:
+                            cw = (weather_data.get("current_weather") or {})
+                            loc = (weather_data.get("location") or {})
+                            note = (loc.get("note") or "")
+                            weather_section_text = (
+                                f"Location: {loc.get('resolved_name')}, {loc.get('country')} "
+                                f"({loc.get('latitude')}, {loc.get('longitude')})\n"
+                                f"Temperature: {cw.get('temperature')}°C\n"
+                                f"Wind: {cw.get('windspeed')} km/h, direction {cw.get('winddirection')}\n"
+                                f"Time: {cw.get('time')}"
+                            )
+                            if note:
+                                weather_section_text += f"\nNOTE: {note}"
 
-            Current date/time: {now_str}
+                    # 4) Build YandexGPT prompt
+                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    user_prompt = textwrap.dedent(
+                        f"""
+                        Create a structured report about the topic: "{topic}".
 
-            SECTION 1. Background (from my local documents)
-            ----------------------------------------------
-            {background_text}
+                        Current date/time: {now_str}
 
-            SECTION 2. Latest news on this topic
-            ------------------------------------
-            Raw news data (already partially formatted):
+                        SECTION 1. Background (from my local documents)
+                        ----------------------------------------------
+                        {background_text}
 
-            {news_section_text}
+                        SECTION 2. Latest news on this topic
+                        ------------------------------------
+                        Raw news data (already partially formatted):
 
-            SECTION 3. Context (weather) – optional
-            ---------------------------------------
-            {weather_section_text or '(no weather data requested or available)'}
+                        {news_section_text}
 
-            Requirements:
-            - Write a clear, concise report with 3–5 sections.
-            - Start with a short summary (3–5 bullet points).
-            - Then have separate sections for background, recent developments, and context.
-            - Do NOT mention that this comes from tools or MCP – just present it as a normal report.
-            - Limit length to a few paragraphs per section.
-            """
-        ).strip()
+                        SECTION 3. Context (weather) – optional
+                        ---------------------------------------
+                        {weather_section_text or '(no weather data requested or available)'}
 
-        print("\n[LLM] Calling YandexGPT to generate final report...")
-        final_report = call_yandex_report_model(user_prompt)
+                        Requirements:
+                        - Write a clear, concise report with 3–5 sections.
+                        - Start with a short summary (3–5 bullet points).
+                        - Then have separate sections for background, recent developments, and context.
+                        - Do NOT mention that this comes from tools or MCP – just present it as a normal report.
+                        - Limit length to a few paragraphs per section.
+                        """
+                    ).strip()
 
-        print("\n=== Final Report (preview) ===")
-        print(final_report[:1000])
-        if len(final_report) > 1000:
-            print("\n... (truncated, full text will be saved to file)")
+                    print("\n[LLM] Calling YandexGPT to generate final report...")
+                    final_report = call_yandex_report_model(user_prompt)
 
-        # 5) Save via docs MCP
-        saved_path = await docs_save_report(docs_session, final_report, topic)
+                    print("\n=== Final Report (preview) ===")
+                    print(final_report[:1000])
+                    if len(final_report) > 1000:
+                        print("\n... (truncated, full text will be saved to file)")
 
-        print("\n=== Saved Report ===")
-        if saved_path:
-            print(f"Report saved to: {saved_path}")
-        else:
-            print("Could not determine saved file path from save_to_file response.")
+                    # 5) Save via docs MCP
+                    saved_path = await docs_save_report(docs_session, final_report, topic)
+
+                    print("\n=== Saved Report ===")
+                    if saved_path:
+                        print(f"Report saved to: {saved_path}")
+                    else:
+                        print("Could not determine saved file path from save_to_file response.")
 
 
 def main() -> None:
