@@ -1,5 +1,5 @@
 # chat_logic.py
-from typing import Any, Dict
+from typing import Any, Dict, Tuple, Optional
 
 from db import (
     archive_non_summary_messages,
@@ -47,26 +47,25 @@ def _print_usage(usage: Dict[str, Any], messages_sent: int, label: str) -> None:
 
 
 # =========================
-# HIGH-LEVEL OPERATIONS
+# CORE OPERATIONS (для UI и CLI)
 # =========================
 
-def ask_llm_for_chat_answer(
+def chat_turn(
     conversation_id: int,
     user_text: str,
     model_name: str,
-) -> None:
+) -> Tuple[Optional[str], Dict[str, Any], int]:
     """
-    Normal chat turn:
-    - save user message
-    - load active history
-    - call LLM with system + history
-    - save assistant reply
-    - log token usage
+    Выполняет один шаг чата и ВОЗВРАЩАЕТ результат, не печатая ничего.
+    Используется как из UI, так и из CLI-обёртки.
+
+    Возвращает:
+      (reply_text | None при ошибке, usage_dict (может быть пустым), messages_sent)
     """
-    # Save user message
+    # Сохраняем пользовательское сообщение
     save_message(conversation_id, "user", user_text)
 
-    # Load active messages from DB and build full context
+    # Загружаем активные сообщения и строим контекст
     history = load_active_messages(conversation_id)
 
     messages_for_api = [{"role": "system", "text": BASE_SYSTEM_PROMPT}]
@@ -79,37 +78,44 @@ def ask_llm_for_chat_answer(
             max_tokens=1500,
             model_name=model_name,
         )
-    except LlmError as e:
-        print(f"\n[ERROR] LLM call failed: {e}")
-        return
+    except LlmError:
+        # Ошибку логируем/отображаем на более высоком уровне (UI/CLI)
+        return None, {}, len(messages_for_api)
 
-    # Save assistant reply
+    # Сохраняем ответ ассистента
     save_message(conversation_id, "assistant", reply_text)
 
-    # Stats and logging
+    # Сохраняем статистику
     save_stats(conversation_id, usage, model_name=model_name)
 
-    print("\nASSISTANT:\n" + reply_text)
-    _print_usage(usage, messages_sent=len(messages_for_api), label="chat")
+    return reply_text, usage, len(messages_for_api)
 
 
-def summarize_conversation(
+def summarize_conversation_core(
     conversation_id: int,
     max_tokens_for_summary: int,
     model_name: str,
-) -> None:
+) -> Tuple[Optional[str], Dict[str, Any], int]:
     """
-    Summarization:
-    - get active messages
-    - call LLM with summarization system prompt
-    - archive previous non-summary messages
-    - save summary as active system message
-    - log token usage
+    Ядро summarization-логики, без печати, подходит для UI.
+    Делает:
+      - берёт активные сообщения
+      - вызывает LLM с summarization prompt
+      - архивирует предыдущие (не summary) сообщения
+      - сохраняет новый summary как активный system-message
+      - сохраняет статистику
+
+    Возвращает:
+      (summary_text | None если нечего суммировать или ошибка,
+       usage_dict (может быть пустым),
+       messages_sent)
+
+    При ошибке LLM или отсутствии истории БД не модифицируется (кроме уже существующего состояния).
     """
     history = load_active_messages(conversation_id)
     if not history:
-        print("Nothing to summarize: no active messages.")
-        return
+        # Нечего суммировать
+        return None, {}, 0
 
     system_text = SUMMARY_SYSTEM_PROMPT_TEMPLATE.format(
         max_tokens=max_tokens_for_summary
@@ -125,14 +131,13 @@ def summarize_conversation(
             max_tokens=max_tokens_for_summary,
             model_name=model_name,
         )
-    except LlmError as e:
-        print(f"\n[ERROR] LLM call failed: {e}")
-        return
+    except LlmError:
+        return None, {}, len(messages_for_api)
 
-    # Archive all previous (non-summary) messages
+    # Архивируем все предыдущие не-summary сообщения
     archive_non_summary_messages(conversation_id)
 
-    # Save new summary message as active
+    # Сохраняем новый summary как активное system-сообщение
     save_message(
         conversation_id,
         "system",
@@ -141,7 +146,61 @@ def summarize_conversation(
         is_active=True,
     )
 
+    # Сохраняем статистику
     save_stats(conversation_id, usage, model_name=model_name)
 
-    print("\nSUMMARY:\n" + reply_text)
-    _print_usage(usage, messages_sent=len(messages_for_api), label="summary")
+    return reply_text, usage, len(messages_for_api)
+
+
+# =========================
+# CLI-ОБЁРТКИ (оставляем старый интерфейс)
+# =========================
+
+def ask_llm_for_chat_answer(
+    conversation_id: int,
+    user_text: str,
+    model_name: str,
+) -> None:
+    """
+    Обёртка для консольной версии:
+    - вызывает chat_turn
+    - печатает результат и usage
+    """
+    reply_text, usage, messages_sent = chat_turn(
+        conversation_id, user_text, model_name
+    )
+
+    if reply_text is None:
+        print(f"\n[ERROR] LLM call failed.")
+        return
+
+    print("\nASSISTANT:\n" + reply_text)
+    _print_usage(usage, messages_sent=messages_sent, label="chat")
+
+
+def summarize_conversation(
+    conversation_id: int,
+    max_tokens_for_summary: int,
+    model_name: str,
+) -> None:
+    """
+    Обёртка для консольной версии summarization:
+    - вызывает summarize_conversation_core
+    - печатает summary и usage
+    """
+    summary_text, usage, messages_sent = summarize_conversation_core(
+        conversation_id,
+        max_tokens_for_summary,
+        model_name,
+    )
+
+    if messages_sent == 0:
+        print("Nothing to summarize: no active messages.")
+        return
+
+    if summary_text is None:
+        print("\n[ERROR] Summarization failed.")
+        return
+
+    print("\nSUMMARY:\n" + summary_text)
+    _print_usage(usage, messages_sent=messages_sent, label="summary")
