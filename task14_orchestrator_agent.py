@@ -28,12 +28,17 @@ import json
 import os
 import sys
 import textwrap
+from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
 
-from mcp.client.stdio import StdioServerParameters, connect_stdio
-from mcp.client.session import ClientSession
+# ---- load .env FIRST ----
+load_dotenv()  # will load YAC_FOLDER and YAC_API_KEY from .env
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 # -----------------------------
 # YandexGPT config
@@ -51,7 +56,7 @@ def call_yandex_report_model(prompt: str, model: str = "yandexgpt") -> str:
     if not YAC_FOLDER or not YAC_API_KEY:
         return (
             "Error: YandexGPT config is missing. "
-            "Please set YAC_FOLDER and YAC_API_KEY environment variables."
+            "Please ensure .env contains YAC_FOLDER and YAC_API_KEY."
         )
 
     headers = {
@@ -95,16 +100,27 @@ def call_yandex_report_model(prompt: str, model: str = "yandexgpt") -> str:
 # MCP client helpers
 # -----------------------------
 
-async def open_mcp_session(command: List[str]) -> ClientSession:
+async def open_mcp_session(
+    command: List[str],
+    stack: AsyncExitStack,
+) -> ClientSession:
     """
-    Open a persistent MCP session to a given server command.
+    Open a persistent MCP session to a given server command using stdio_client.
 
-    NOTE: If in your Day 13 code you use a slightly different pattern for
-    connect_stdio / ClientSession, feel free to copy that implementation here.
+    Example command: [sys.executable, "task13_docs_tools_mcp_server.py"]
     """
-    params = StdioServerParameters(command=command)
-    conn = await connect_stdio(params)
-    session = ClientSession(conn)
+    server_params = StdioServerParameters(
+        command=command[0],
+        args=command[1:],
+        env=None,
+    )
+
+    # start server process and get (read, write) streams
+    stdio_transport = await stack.enter_async_context(stdio_client(server_params))
+    read, write = stdio_transport
+
+    # attach a ClientSession to the same stack
+    session = await stack.enter_async_context(ClientSession(read, write))
     await session.initialize()
     return session
 
@@ -118,17 +134,14 @@ async def call_tool(
     Generic tool call wrapper with basic error handling.
     """
     result = await session.call_tool(tool_name, arguments)
-    # result is usually a ToolResponse with "content" – we assume JSON or text.
-    # We try to parse JSON first, otherwise return raw text.
+
     if not result.content:
         return None
 
-    # For simplicity, handle only first content item.
     item = result.content[0]
 
     if item.type == "text":
         text = item.text
-        # Try JSON
         try:
             return json.loads(text)
         except Exception:
@@ -137,7 +150,6 @@ async def call_tool(
     if item.type == "json":
         return item.json
 
-    # Fallback: just return entire content list
     return [c.to_dict() for c in result.content]
 
 
@@ -165,7 +177,6 @@ async def docs_search_and_summarize(
     if not matches:
         return f"No local documents found for topic: {topic}."
 
-    # Assume each match has "content" field with full text
     texts: List[str] = []
     for m in matches[:max_docs]:
         content = m.get("content") or ""
@@ -180,7 +191,6 @@ async def docs_search_and_summarize(
     print("[Docs] Calling summarize_text on collected content...")
     summary_res = await call_tool(docs_session, "summarize_text", {"text": combined_text})
 
-    # summary_res might be dict with "summary" or just a string
     if isinstance(summary_res, dict) and "summary" in summary_res:
         return summary_res["summary"]
     if isinstance(summary_res, str):
@@ -198,7 +208,6 @@ async def docs_save_report(
     Save final report via docs MCP save_to_file.
     """
     today = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    # Cheap slug
     slug = "".join(ch for ch in topic.lower().replace(" ", "_") if ch.isalnum() or ch == "_")
     filename_hint = f"day14_report_{slug}_{today}"
 
@@ -210,12 +219,10 @@ async def docs_save_report(
     )
 
     if isinstance(save_res, dict):
-        # In Day 13 we probably returned something like {"path": "...", "filename": "..."}
         path = save_res.get("path") or save_res.get("file_path") or save_res.get("filename")
         return path
 
     if isinstance(save_res, str):
-        # Maybe the server returns just the path string.
         return save_res.strip()
 
     return None
@@ -267,19 +274,18 @@ async def orchestrate(topic: str, city: str) -> None:
     Main Day 14 orchestration pipeline.
     """
     print("\n=== Day 14 – Orchestration (Docs + News + Weather) ===")
-    print("Starting MCP servers and opening sessions...")
 
-    # Adjust paths/commands if needed
     docs_cmd = [sys.executable, "task13_docs_tools_mcp_server.py"]
     news_cmd = [sys.executable, "task14_news_weather_mcp_server.py"]
 
-    # Open both sessions in parallel
-    docs_session, news_session = await asyncio.gather(
-        open_mcp_session(docs_cmd),
-        open_mcp_session(news_cmd),
-    )
+    # use one AsyncExitStack to manage both MCP sessions
+    async with AsyncExitStack() as stack:
+        print("Opening MCP sessions...")
+        docs_session, news_session = await asyncio.gather(
+            open_mcp_session(docs_cmd, stack),
+            open_mcp_session(news_cmd, stack),
+        )
 
-    try:
         # 1) Docs: background
         background_text = await docs_search_and_summarize(docs_session, topic)
 
@@ -316,6 +322,7 @@ async def orchestrate(topic: str, city: str) -> None:
             else:
                 cw = (weather_data.get("current_weather") or {})
                 loc = (weather_data.get("location") or {})
+                note = (loc.get("note") or "")
                 weather_section_text = (
                     f"Location: {loc.get('resolved_name')}, {loc.get('country')} "
                     f"({loc.get('latitude')}, {loc.get('longitude')})\n"
@@ -323,6 +330,8 @@ async def orchestrate(topic: str, city: str) -> None:
                     f"Wind: {cw.get('windspeed')} km/h, direction {cw.get('winddirection')}\n"
                     f"Time: {cw.get('time')}"
                 )
+                if note:
+                    weather_section_text += f"\nNOTE: {note}"
 
         # 4) Build YandexGPT prompt
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -371,11 +380,6 @@ async def orchestrate(topic: str, city: str) -> None:
             print(f"Report saved to: {saved_path}")
         else:
             print("Could not determine saved file path from save_to_file response.")
-
-    finally:
-        # Close MCP sessions
-        await docs_session.close()
-        await news_session.close()
 
 
 def main() -> None:

@@ -21,10 +21,6 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("task14-news-weather")
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
 def _debug_log(*args: Any) -> None:
     """Simple stderr logger to not pollute tool outputs."""
     print("[task14_news_weather]", *args, file=sys.stderr)
@@ -34,8 +30,22 @@ def _debug_log(*args: Any) -> None:
 # Weather (Open-Meteo)
 # -----------------------------
 
+AMSTERDAM_FALLBACK = {
+    "name": "Amsterdam",
+    "country": "Netherlands",
+    "country_code": "NL",
+    "latitude": 52.37403,
+    "longitude": 4.88969,
+}
+
+
 def _geocode_location(name: str) -> Dict[str, Any]:
-    """Use Open-Meteo geocoding to resolve a city name into coordinates."""
+    """
+    Use Open-Meteo geocoding to resolve a city name into coordinates.
+
+    If the API fails or returns no results, fall back to Amsterdam and
+    include a note about this in the output.
+    """
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {
         "name": name,
@@ -43,21 +53,48 @@ def _geocode_location(name: str) -> Dict[str, Any]:
         "language": "en",
         "format": "json",
     }
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
 
-    if not data.get("results"):
-        raise ValueError(f"Location not found: {name}")
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        _debug_log(f"Geocoding error for {name!r}: {e!r}")
+        _debug_log("Falling back to Amsterdam coordinates.")
+        fb = dict(AMSTERDAM_FALLBACK)
+        fb["note"] = f"Geocoding failed for {name!r}, using Amsterdam as fallback."
+        return fb
 
-    r0 = data["results"][0]
-    return {
-        "name": r0.get("name"),
-        "country": r0.get("country"),
-        "country_code": r0.get("country_code"),
-        "latitude": r0.get("latitude"),
-        "longitude": r0.get("longitude"),
+    results = data.get("results") or []
+    if not results:
+        _debug_log(f"Geocoding returned no results for {name!r}. Falling back to Amsterdam.")
+        fb = dict(AMSTERDAM_FALLBACK)
+        fb["note"] = (
+            f"Geocoding returned no results for {name!r}, "
+            "using Amsterdam as fallback."
+        )
+        return fb
+
+    r0 = results[0]
+    loc = {
+        "name": r0.get("name") or AMSTERDAM_FALLBACK["name"],
+        "country": r0.get("country") or AMSTERDAM_FALLBACK["country"],
+        "country_code": r0.get("country_code") or AMSTERDAM_FALLBACK["country_code"],
+        "latitude": r0.get("latitude") or AMSTERDAM_FALLBACK["latitude"],
+        "longitude": r0.get("longitude") or AMSTERDAM_FALLBACK["longitude"],
     }
+
+    # If for some reason lat/lon are missing, mark fallback as well
+    if loc["latitude"] is None or loc["longitude"] is None:
+        _debug_log(f"Geocoding missing coords for {name!r}. Using Amsterdam fallback coords.")
+        loc["latitude"] = AMSTERDAM_FALLBACK["latitude"]
+        loc["longitude"] = AMSTERDAM_FALLBACK["longitude"]
+        loc["note"] = (
+            f"Geocoding succeeded but coordinates were missing for {name!r}, "
+            "using Amsterdam fallback coordinates."
+        )
+
+    return loc
 
 
 def _fetch_current_weather(lat: float, lon: float, units: str = "metric") -> Dict[str, Any]:
@@ -108,6 +145,7 @@ def get_weather(
 
     Returns:
         A JSON object with resolved location info and current weather.
+        If geocoding fails, falls back to Amsterdam and includes a note.
     """
     try:
         _debug_log(f"get_weather called: location={location!r}, country_code={country_code!r}, units={units!r}")
@@ -126,6 +164,7 @@ def get_weather(
                 "country_code": loc.get("country_code"),
                 "latitude": lat,
                 "longitude": lon,
+                "note": loc.get("note", ""),  # will mention Amsterdam fallback if used
             },
             "units": units,
             "current_weather": current,
@@ -215,5 +254,4 @@ def get_news(
 
 
 if __name__ == "__main__":
-    # Standard FastMCP entrypoint
     mcp.run()
