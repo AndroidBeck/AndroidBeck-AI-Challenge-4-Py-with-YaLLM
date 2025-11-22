@@ -72,10 +72,9 @@ def chat_turn(
     messages_for_api.extend(history)
 
     try:
+        # temperature и max_tokens придут из конфига по умолчанию
         reply_text, usage = call_yandex_llm(
             messages_for_api,
-            temperature=0.6,
-            max_tokens=1500,
             model_name=model_name,
         )
     except LlmError as e:

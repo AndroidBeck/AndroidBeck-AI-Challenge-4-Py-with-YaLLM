@@ -21,6 +21,7 @@ from db import (
 )
 from llm_client import MODEL_MAP, get_default_model_name
 from chat_logic import chat_turn, summarize_conversation_core
+from config import get_summary_default_max_tokens, set_default_model
 
 
 def select_or_create_conversation() -> int:
@@ -110,6 +111,9 @@ class MainWindow(QMainWindow):
         # current model
         self.current_model_name = get_default_model_name()
 
+        # дефолтный размер summary из конфига
+        self.summary_default_tokens = get_summary_default_max_tokens()
+
         # Хранители текущих потоков, чтобы их не схлопнул GC
         self.current_thread = None
         self.current_worker = None
@@ -139,7 +143,9 @@ class MainWindow(QMainWindow):
         top_controls.addWidget(QLabel("Model:"))
         top_controls.addWidget(self.model_combo)
 
-        self.summary_button = QPushButton("Summarize (400 tokens)")
+        self.summary_button = QPushButton(
+            f"Summarize ({self.summary_default_tokens} tokens)"
+        )
         self.summary_button.clicked.connect(self.on_summarize_clicked)
         top_controls.addWidget(self.summary_button)
 
@@ -212,6 +218,7 @@ class MainWindow(QMainWindow):
         model_name = self.model_combo.itemData(index)
         if model_name:
             self.current_model_name = model_name
+            set_default_model(model_name)  # сохраняем выбранную модель в конфиг
             self.status_label.setText(f"Model changed to: {model_name}")
 
     def on_new_conversation_clicked(self) -> None:
@@ -220,7 +227,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("New conversation started.")
 
     def on_summarize_clicked(self) -> None:
-        max_tokens = 400
+        max_tokens = self.summary_default_tokens
         # Запускаем summary в отдельном потоке
         self.set_busy(True, "Summarizing...")
 
@@ -304,7 +311,7 @@ class MainWindow(QMainWindow):
                     self.status_label.setText("Invalid token count for summarize.")
                     return
             else:
-                max_tokens = 400
+                max_tokens = self.summary_default_tokens
 
             # запуск summarization через кнопку/команду
             self.set_busy(True, "Summarizing...")

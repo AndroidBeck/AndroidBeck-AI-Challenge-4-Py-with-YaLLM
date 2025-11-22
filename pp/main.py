@@ -7,6 +7,7 @@ from db import (
 )
 from chat_logic import ask_llm_for_chat_answer, summarize_conversation
 from llm_client import MODEL_MAP, get_default_model_name
+from config import get_summary_default_max_tokens, set_default_model
 
 
 def _select_or_create_conversation() -> int:
@@ -104,6 +105,7 @@ def main() -> None:
                 continue
 
             current_model_name = MODEL_MAP[idx]
+            set_default_model(current_model_name)  # сохраняем в конфиг
             print(f"Model changed to: {current_model_name}")
             continue
 
@@ -120,8 +122,8 @@ def main() -> None:
                     print("Invalid token count. Usage: /summarize 400")
                     continue
             else:
-                # Default summary length
-                max_tokens_for_summary = 400
+                # Default summary length from config
+                max_tokens_for_summary = get_summary_default_max_tokens()
 
             summarize_conversation(
                 conversation_id,

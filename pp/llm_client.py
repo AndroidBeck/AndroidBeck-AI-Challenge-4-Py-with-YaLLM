@@ -1,9 +1,14 @@
-# llm_client.py
 import os
 from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 
+from config import (
+    load_config,
+    get_model_map,
+    get_chat_temperature,
+    get_chat_max_tokens,
+)
 
 # =========================
 # YandexGPT CONFIG
@@ -14,20 +19,14 @@ YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 YAC_FOLDER = os.getenv("YAC_FOLDER")
 YAC_API_KEY = os.getenv("YAC_API_KEY")
 
-# Prefer full yandexgpt over lite in this AI challenge
-YAC_MODEL_ENV = os.getenv("YAC_MODEL", "yandexgpt")
-
+# Если задано через env — это имеет приоритет как "форс-модель"
+YAC_MODEL_ENV = os.getenv("YAC_MODEL")
 
 # =========================
-# MODEL MAP
+# MODEL MAP (из конфига)
 # =========================
 
-MODEL_MAP: Dict[int, str] = {
-    1: "yandexgpt",
-    2: "yandexgpt-lite",
-    3: "qwen2.5-7b-instruct", # "qwen3-235b-a22b-fp8/latest",
-    4: "gpt-oss-120b/latest",
-}
+MODEL_MAP: Dict[int, str] = get_model_map()
 
 
 class LlmError(RuntimeError):
@@ -36,34 +35,48 @@ class LlmError(RuntimeError):
 
 def get_default_model_name() -> str:
     """
-    Default model used if none explicitly selected.
-    Priority:
-      1) YAC_MODEL env, if present
-      2) model #1 from MODEL_MAP (yandexgpt)
+    Дефолтная модель, если явно не указана.
+    Приоритет:
+      1) YAC_MODEL env, если задан
+      2) default_model из конфига
+      3) первая модель из MODEL_MAP
+      4) "yandexgpt" как совсем последний fallback
     """
     if YAC_MODEL_ENV:
         return YAC_MODEL_ENV
 
-    return MODEL_MAP[1]
+    cfg = load_config()
+    model_from_cfg = cfg.get("default_model")
+    if model_from_cfg:
+        return model_from_cfg
+
+    if MODEL_MAP:
+        # первая модель по индексу
+        return next(iter(MODEL_MAP.values()))
+
+    return "yandexgpt"
 
 
 def get_model_name_by_index(index: int) -> Optional[str]:
     """
-    Returns model name for index (1..5) or None if invalid.
+    Возвращает имя модели по индексу или None, если индекс неверный.
     """
     return MODEL_MAP.get(index)
 
 
 def call_yandex_llm(
     messages: List[Dict[str, str]],
-    temperature: float = 0.6,
-    max_tokens: int = 1500,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
     model_name: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     messages: list of {"role": "system"|"user"|"assistant", "text": "..."}
 
     Returns (reply_text, usage_dict)
+
+    Если temperature или max_tokens не заданы — берутся из конфига.
+    Если model_name не задано — берётся дефолтная модель.
     """
     if not YAC_FOLDER or not YAC_API_KEY:
         raise LlmError("Missing YAC_FOLDER or YAC_API_KEY environment variables")
@@ -71,11 +84,17 @@ def call_yandex_llm(
     if model_name is None:
         model_name = get_default_model_name()
 
+    if temperature is None:
+        temperature = get_chat_temperature()
+
+    if max_tokens is None:
+        max_tokens = get_chat_max_tokens()
+
     payload = {
         "modelUri": f"gpt://{YAC_FOLDER}/{model_name}",
         "completionOptions": {
-            "temperature": temperature,
-            "maxTokens": max_tokens,
+            "temperature": float(temperature),
+            "maxTokens": int(max_tokens),
             "stream": False,
         },
         "messages": messages,
