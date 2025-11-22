@@ -144,6 +144,20 @@ class SettingsDialog(QDialog):
         return self.temp_spin.value(), self.max_tokens_spin.value()
 
 
+class ChatInput(QTextEdit):
+    sendRequested = Signal()
+
+    def keyPressEvent(self, event):
+        # Если Enter / Return без Shift → отправляем сообщение
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if not (event.modifiers() & Qt.ShiftModifier):
+                # не вставляем перенос строки, а отправляем
+                self.sendRequested.emit()
+                return
+        # во всех остальных случаях — стандартное поведение
+        super().keyPressEvent(event)
+
+
 # =========================
 # MAIN WINDOW
 # =========================
@@ -213,13 +227,16 @@ class MainWindow(QMainWindow):
         bottom_layout = QHBoxLayout()
         main_layout.addLayout(bottom_layout)
 
-        self.input_edit = QTextEdit()
+        self.input_edit = ChatInput()
         self.input_edit.setPlaceholderText(
             "Type your message here...\n"
-            "(Shift+Enter для новой строки, Enter по кнопке \"Send\")"
+            "Enter – отправить, Shift+Enter – новая строка"
         )
         self.input_edit.setFixedHeight(100)
         bottom_layout.addWidget(self.input_edit)
+
+        # Enter в поле ввода → отправка сообщения
+        self.input_edit.sendRequested.connect(self.on_send_clicked)
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.on_send_clicked)
