@@ -10,6 +10,11 @@ from PySide6.QtWidgets import (
     QPushButton,
     QComboBox,
     QLabel,
+    QDialog,
+    QFormLayout,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QSpinBox,
 )
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread
 
@@ -21,7 +26,14 @@ from db import (
 )
 from llm_client import MODEL_MAP, get_default_model_name
 from chat_logic import chat_turn, summarize_conversation_core
-from config import get_summary_default_max_tokens, set_default_model
+from config import (
+    get_summary_default_max_tokens,
+    set_default_model,
+    get_chat_temperature,
+    get_chat_max_tokens,
+    set_chat_temperature,
+    set_chat_max_tokens,
+)
 
 
 def select_or_create_conversation() -> int:
@@ -93,6 +105,45 @@ class SummaryWorker(QObject):
         self.finished.emit(summary_text, usage, messages_sent, error_msg)
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Settings")
+
+        form_layout = QFormLayout(self)
+
+        # Температура
+        current_temp = get_chat_temperature()
+        self.temp_spin = QDoubleSpinBox()
+        self.temp_spin.setRange(0.0, 2.0)
+        self.temp_spin.setSingleStep(0.1)
+        self.temp_spin.setDecimals(2)
+        self.temp_spin.setValue(current_temp)
+        form_layout.addRow("Temperature:", self.temp_spin)
+
+        # max_tokens
+        current_max_tokens = get_chat_max_tokens()
+        self.max_tokens_spin = QSpinBox()
+        # Диапазон можно подправить под себя
+        self.max_tokens_spin.setRange(100, 40000)
+        self.max_tokens_spin.setSingleStep(100)
+        self.max_tokens_spin.setValue(current_max_tokens)
+        form_layout.addRow("Max tokens:", self.max_tokens_spin)
+
+        # Кнопки OK / Cancel
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form_layout.addRow(buttons)
+
+    def get_values(self) -> tuple[float, int]:
+        return self.temp_spin.value(), self.max_tokens_spin.value()
+
+
 # =========================
 # MAIN WINDOW
 # =========================
@@ -153,6 +204,11 @@ class MainWindow(QMainWindow):
         self.new_button.clicked.connect(self.on_new_conversation_clicked)
         top_controls.addWidget(self.new_button)
 
+        # Settings
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.clicked.connect(self.on_settings_clicked)
+        top_controls.addWidget(self.settings_button)
+
         # Bottom area: multiline input + send button
         bottom_layout = QHBoxLayout()
         main_layout.addLayout(bottom_layout)
@@ -198,6 +254,8 @@ class MainWindow(QMainWindow):
         self.summary_button.setEnabled(not busy)
         self.new_button.setEnabled(not busy)
         self.model_combo.setEnabled(not busy)
+        self.settings_button.setEnabled(not busy)  # ← добавили
+
         if busy:
             self.status_label.setText(message or "Working...")
         else:
@@ -225,6 +283,20 @@ class MainWindow(QMainWindow):
         self.conversation_id = create_conversation()
         self.append_system_text(f"Started NEW conversation #{self.conversation_id}.")
         self.status_label.setText("New conversation started.")
+
+    def on_settings_clicked(self) -> None:
+        dlg = SettingsDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            new_temp, new_max_tokens = dlg.get_values()
+
+            # Сохраняем в конфиг
+            set_chat_temperature(new_temp)
+            set_chat_max_tokens(new_max_tokens)
+
+            # Эти значения подхватятся при следующих вызовах call_yandex_llm
+            self.status_label.setText(
+                f"Settings updated: temperature={new_temp:.2f}, max_tokens={new_max_tokens}"
+            )
 
     def on_summarize_clicked(self) -> None:
         max_tokens = self.summary_default_tokens
