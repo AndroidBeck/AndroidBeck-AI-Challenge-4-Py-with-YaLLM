@@ -417,7 +417,7 @@ def main():
     parser.add_argument(
         "--index-type",
         type=str,
-        default="all",
+        default="sqlite",
         choices=["json", "sqlite", "faiss", "all"],
         help="Which index type to build (default: all)",
     )
