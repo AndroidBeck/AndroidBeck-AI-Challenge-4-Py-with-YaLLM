@@ -21,16 +21,16 @@ except ImportError:
 # CONFIG
 # =========================
 
-# DOCS directory (you can override via CLI)
+# Docs directory (you can override via CLI)
 DEFAULT_DOCS_DIR = "docs"
 DEFAULT_INDEX_DIR = "indexes"
 
-# OpenAI embeddings config
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-OPENAI_EMBEDDING_URL = "https://api.openai.com/v1/embeddings"
+# Ollama embeddings config
+# Make sure Ollama is running locally: `ollama serve` (or app is running)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
-# Chunking config (chars, not tokens – simple but works fine for now)
+# Chunking config (simple char-based chunking)
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
@@ -122,42 +122,44 @@ def chunk_text(text: str,
 
 
 # =========================
-# UTIL: EMBEDDINGS (OpenAI)
+# UTIL: EMBEDDINGS (Ollama)
 # =========================
 
-def get_embedding_openai(text: str) -> List[float]:
+def get_embedding_ollama(text: str) -> List[float]:
     """
-    Fetch embedding from OpenAI Embeddings API.
-    You must have OPENAI_API_KEY set.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set in environment variables")
+    Fetch embedding from local Ollama using /api/embed.
 
+    Requires:
+      - Ollama running locally
+      - `ollama pull nomic-embed-text` (or set OLLAMA_EMBED_MODEL)
+    """
+    url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
     payload = {
-        "model": OPENAI_EMBEDDING_MODEL,
-        "input": text,
+        "model": OLLAMA_EMBED_MODEL,
+        "input": text,  # can also be a list; we use single string here
     }
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    resp = requests.post(OPENAI_EMBEDDING_URL, headers=headers, json=payload, timeout=60)
+    resp = requests.post(url, json=payload, timeout=120)
     if resp.status_code != 200:
-        raise RuntimeError(f"OpenAI API error {resp.status_code}: {resp.text}")
+        raise RuntimeError(
+            f"Ollama embed API error {resp.status_code}: {resp.text}"
+        )
 
     data = resp.json()
-    return data["data"][0]["embedding"]
+    # Docs / examples show `embeddings` as a list of vectors
+    embeddings = data.get("embeddings")
+    if not embeddings or not isinstance(embeddings, list):
+        raise RuntimeError(
+            f"Unexpected Ollama embed response format: {data}"
+        )
+
+    # We passed a single string, so take the first vector
+    return embeddings[0]
 
 
-# Wrapper for possible future providers
-def get_embedding(text: str, provider: str = "openai") -> List[float]:
-    provider = provider.lower()
-    if provider == "openai":
-        return get_embedding_openai(text)
-    else:
-        raise ValueError(f"Unknown embeddings provider: {provider}")
+def get_embedding(text: str) -> List[float]:
+    """Wrapper in case we add more providers later."""
+    return get_embedding_ollama(text)
 
 
 # =========================
@@ -255,7 +257,9 @@ class FaissIndexWriter(BaseIndexWriter):
 
     def __init__(self, index_path: pathlib.Path, meta_path: pathlib.Path):
         if not HAS_FAISS:
-            raise RuntimeError("faiss is not installed. Install with `pip install faiss-cpu`.")
+            raise RuntimeError(
+                "faiss is not installed. Install with `pip install faiss-cpu`."
+            )
 
         self.index_path = index_path
         self.meta_path = meta_path
@@ -319,7 +323,6 @@ def iter_documents(root_dir: pathlib.Path) -> Iterable[pathlib.Path]:
 def build_index(
     docs_dir: pathlib.Path,
     index_type: str,
-    embeddings_provider: str,
     index_dir: pathlib.Path,
 ):
     index_type = index_type.lower()
@@ -372,12 +375,18 @@ def build_index(
             for chunk_index, (chunk_text_val, start_char, end_char) in enumerate(chunks):
                 global_chunk_id += 1
                 # Maybe small preview for logs
-                preview = textwrap.shorten(chunk_text_val.replace("\n", " "), width=80)
+                preview = textwrap.shorten(
+                    chunk_text_val.replace("\n", " "), width=80
+                )
 
-                print(f"    [Chunk #{global_chunk_id}] doc_chunk_index={chunk_index}, "
-                      f"chars={start_char}-{end_char}, preview='{preview}'")
+                print(
+                    f"    [Chunk #{global_chunk_id}] "
+                    f"doc_chunk_index={chunk_index}, "
+                    f"chars={start_char}-{end_char}, "
+                    f"preview='{preview}'"
+                )
 
-                embedding = get_embedding(chunk_text_val, provider=embeddings_provider)
+                embedding = get_embedding(chunk_text_val)
 
                 item = {
                     "id": global_chunk_id,
@@ -400,7 +409,7 @@ def build_index(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Day 15 – Documents indexing: chunking + embeddings + local index."
+        description="Day 15 – Documents indexing with Ollama: chunking + embeddings + local index."
     )
     parser.add_argument(
         "--docs-dir",
@@ -417,15 +426,9 @@ def main():
     parser.add_argument(
         "--index-type",
         type=str,
-        default="sqlite",
+        default="all",
         choices=["json", "sqlite", "faiss", "all"],
         help="Which index type to build (default: all)",
-    )
-    parser.add_argument(
-        "--provider",
-        type=str,
-        default="openai",
-        help="Embeddings provider (currently only 'openai' implemented)",
     )
 
     args = parser.parse_args()
@@ -437,18 +440,17 @@ def main():
         print(f"[ERROR] Docs dir does not exist: {docs_dir}")
         return
 
-    print("=== Day 15 – Documents Indexing ===")
-    print(f"Docs directory  : {docs_dir}")
-    print(f"Index directory : {index_dir}")
-    print(f"Index type      : {args.index_type}")
-    print(f"Embeddings prov.: {args.provider}")
-    print(f"Embedding model : {OPENAI_EMBEDDING_MODEL}")
+    print("=== Day 15 – Documents Indexing (Ollama) ===")
+    print(f"Docs directory   : {docs_dir}")
+    print(f"Index directory  : {index_dir}")
+    print(f"Index type       : {args.index_type}")
+    print(f"Ollama base URL  : {OLLAMA_BASE_URL}")
+    print(f"Ollama embed mdl : {OLLAMA_EMBED_MODEL}")
     print("===============================")
 
     build_index(
         docs_dir=docs_dir,
         index_type=args.index_type,
-        embeddings_provider=args.provider,
         index_dir=index_dir,
     )
 
