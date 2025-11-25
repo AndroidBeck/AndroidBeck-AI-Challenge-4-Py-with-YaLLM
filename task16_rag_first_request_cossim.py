@@ -235,6 +235,7 @@ def command_chunk(conn: sqlite3.Connection, chunk_size: int = 1000, overlap: int
 def load_embeddings(conn: sqlite3.Connection) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns (chunk_ids, matrix) where matrix is shape [N, dim] float32.
+    We also L2-normalize rows so we can use inner-product as cosine similarity.
     """
     cur = conn.cursor()
     cur.execute("SELECT chunk_id, embedding FROM embeddings ORDER BY chunk_id;")
@@ -249,21 +250,28 @@ def load_embeddings(conn: sqlite3.Connection) -> Tuple[np.ndarray, np.ndarray]:
         chunk_ids.append(chunk_id)
         vectors.append(vec)
 
-    matrix = np.vstack(vectors)
+    matrix = np.vstack(vectors)  # shape: [N, dim]
+
+    # --- NEW: normalize each row to unit length for cosine similarity ---
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    # avoid division by zero
+    norms = np.clip(norms, 1e-8, None)
+    matrix = matrix / norms
+
     return np.array(chunk_ids, dtype="int64"), matrix
 
 
 def build_faiss_index(matrix: np.ndarray):
     dim = matrix.shape[1]
-    # inner product works fine for normalized embeddings; here we just use L2
-    index = faiss.IndexFlatL2(dim)
+    # We use inner product on normalized vectors → cosine similarity
+    index = faiss.IndexFlatIP(dim)
     index.add(matrix)
     return index
 
 
 def retrieve_context(conn: sqlite3.Connection, query: str, top_k: int = TOP_K) -> List[Tuple[str, str]]:
     """
-    Returns a list of (doc_path, text) for top_k chunks.
+    Returns a list of (doc_path, text) for top_k chunks using cosine similarity.
     """
     if faiss is None:
         return []
@@ -276,7 +284,12 @@ def retrieve_context(conn: sqlite3.Connection, query: str, top_k: int = TOP_K) -
     q_emb = get_embedding(query)
     q_vec = np.array(q_emb, dtype="float32").reshape(1, -1)
 
-    index = build_faiss_index(matrix)
+    # --- NEW: normalize query vector for cosine similarity ---
+    q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
+    q_norm = np.clip(q_norm, 1e-8, None)
+    q_vec = q_vec / q_norm
+
+    index = build_faiss_index(matrix)  # now uses IndexFlatIP
     distances, indices = index.search(q_vec, min(top_k, matrix.shape[0]))
 
     retrieved = []
