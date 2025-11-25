@@ -1,458 +1,424 @@
 import os
-import json
-import argparse
-import pathlib
 import sqlite3
+import time
 import textwrap
-from typing import List, Dict, Any, Optional, Iterable, Tuple
+from typing import List, Tuple
 
 import requests
+import numpy as np
 
-# Optional FAISS support
 try:
     import faiss  # pip install faiss-cpu
-    import numpy as np
-    HAS_FAISS = True
 except ImportError:
-    HAS_FAISS = False
+    faiss = None
+    print("WARNING: faiss not installed. Install with `pip install faiss-cpu` "
+          "for fast similarity search. For now, RAG will be disabled.")
 
 
 # =========================
 # CONFIG
 # =========================
 
-# Docs directory (you can override via CLI)
-DEFAULT_DOCS_DIR = "docs"
-DEFAULT_INDEX_DIR = "indexes"
+DB_PATH = "day16_rag.sqlite"
+DOCS_DIR = "docs"
 
-# Ollama embeddings config
-# Make sure Ollama is running locally: `ollama serve` (or app is running)
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+# Ollama embeddings
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+EMBED_MODEL = "nomic-embed-text"
 
-# Chunking config (simple char-based chunking)
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+# YandexGPT config
+YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YAC_FOLDER = os.getenv("YAC_FOLDER")
+YAC_API_KEY = os.getenv("YAC_API_KEY")
+YAGPT_MODEL = os.getenv("YAGPT_MODEL", "yandexgpt-lite")  # or "yandexgpt"
 
-# File extensions we try to read as text
-TEXT_EXTENSIONS = {
-    ".txt", ".md", ".rst",
-    ".py", ".kt", ".java", ".js", ".ts",
-    ".json", ".html", ".css",
-    ".csv", ".tsv", ".sql",
-    ".xml", ".yml", ".yaml",
-}
-
-PDF_EXTENSIONS = {".pdf"}
+TOP_K = 5  # how many chunks to retrieve for RAG
 
 
 # =========================
-# UTIL: LOADING FILE CONTENT
+# DB SETUP
 # =========================
 
-def read_text_file(path: pathlib.Path) -> str:
-    """Read a text file with fallback encodings."""
-    try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return path.read_text(encoding="latin-1", errors="replace")
-
-
-def read_pdf_file(path: pathlib.Path) -> str:
-    """Read a PDF file using PyPDF2 (if installed)."""
-    try:
-        import PyPDF2  # pip install PyPDF2
-    except ImportError:
-        print(f"[WARN] PyPDF2 not installed, skipping PDF: {path}")
-        return ""
-
-    text = []
-    with open(path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            page_text = page.extract_text() or ""
-            text.append(page_text)
-    return "\n".join(text)
-
-
-def load_document(path: pathlib.Path) -> str:
-    """Load text from a file based on extension."""
-    ext = path.suffix.lower()
-    if ext in TEXT_EXTENSIONS:
-        return read_text_file(path)
-    elif ext in PDF_EXTENSIONS:
-        return read_pdf_file(path)
-    else:
-        # Unknown extension – skip or treat as text
-        print(f"[WARN] Skipping unsupported file type: {path}")
-        return ""
+def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_path TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS embeddings (
+            chunk_id INTEGER PRIMARY KEY,
+            embedding BLOB NOT NULL,
+            FOREIGN KEY (chunk_id) REFERENCES chunks (id) ON DELETE CASCADE
+        );
+    """)
+    conn.commit()
+    return conn
 
 
 # =========================
-# UTIL: CHUNKING
+# OLLAMA – EMBEDDINGS
 # =========================
 
-def chunk_text(text: str,
-               chunk_size: int = CHUNK_SIZE,
-               overlap: int = CHUNK_OVERLAP) -> List[Tuple[str, int, int]]:
+def get_embedding(text: str) -> List[float]:
     """
-    Simple character-based chunking with overlap.
-
-    Returns list of (chunk_text, start_index, end_index).
+    Call Ollama embeddings endpoint to get a vector for given text.
+    Requires `ollama serve` + `ollama pull nomic-embed-text`.
     """
-    chunks = []
+    url = f"{OLLAMA_URL}/api/embeddings"
+    payload = {
+        "model": EMBED_MODEL,
+        "prompt": text
+    }
+    resp = requests.post(url, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    # Ollama returns {"embedding": [...]}
+    return data["embedding"]
+
+
+# =========================
+# YANDEX – LLM CALL
+# =========================
+
+def call_llm(prompt: str) -> str:
+    if not YAC_API_KEY or not YAC_FOLDER:
+        raise RuntimeError(
+            "YandexGPT config is missing. Please set YAC_FOLDER and YAC_API_KEY env vars."
+        )
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Api-Key {YAC_API_KEY}",
+        "x-folder-id": YAC_FOLDER,
+    }
+
+    body = {
+        "modelUri": f"gpt://{YAC_FOLDER}/{YAGPT_MODEL}",
+        "completionOptions": {
+            "maxTokens": "800",
+            "temperature": 0.2
+        },
+        "messages": [
+            {
+                "role": "system",
+                "text": (
+                    "You are a helpful assistant. When context from local documents is "
+                    "provided, you must use it to answer the question. If context does not "
+                    "contain the answer, say that you answer based on your general knowledge."
+                ),
+            },
+            {
+                "role": "user",
+                "text": prompt,
+            },
+        ],
+    }
+
+    resp = requests.post(YAGPT_URL, headers=headers, json=body, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # YandexGPT usually returns: result -> alternatives -> message -> text
+    try:
+        alts = data["result"]["alternatives"]
+        texts = [alt["message"]["text"] for alt in alts if "message" in alt]
+        return "\n".join(texts).strip()
+    except Exception:
+        # Fallback: return whole json as string if format unexpected
+        return f"Unexpected LLM response format:\n{data}"
+
+
+# =========================
+# CHUNKING UTILS
+# =========================
+
+def chunk_text(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
+    """
+    Simple character-based sliding-window chunking.
+    """
     text = text.strip()
     if not text:
-        return chunks
+        return []
 
+    chunks = []
     start = 0
     n = len(text)
+    stride = max(1, size - overlap)
 
     while start < n:
-        end = min(start + chunk_size, n)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append((chunk, start, end))
-        # Move start with overlap
-        if end == n:
+        end = start + size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        if end >= n:
             break
-        start = end - overlap
+        start += stride
 
     return chunks
 
 
-# =========================
-# UTIL: EMBEDDINGS (Ollama)
-# =========================
+def iter_docs(doc_dir: str = DOCS_DIR) -> List[str]:
+    paths = []
+    if not os.path.isdir(doc_dir):
+        return paths
 
-def get_embedding_ollama(text: str) -> List[float]:
-    """
-    Fetch embedding from local Ollama using /api/embed.
-
-    Requires:
-      - Ollama running locally
-      - `ollama pull nomic-embed-text` (or set OLLAMA_EMBED_MODEL)
-    """
-    url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
-    payload = {
-        "model": OLLAMA_EMBED_MODEL,
-        "input": text,  # can also be a list; we use single string here
-    }
-
-    resp = requests.post(url, json=payload, timeout=120)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Ollama embed API error {resp.status_code}: {resp.text}"
-        )
-
-    data = resp.json()
-    # Docs / examples show `embeddings` as a list of vectors
-    embeddings = data.get("embeddings")
-    if not embeddings or not isinstance(embeddings, list):
-        raise RuntimeError(
-            f"Unexpected Ollama embed response format: {data}"
-        )
-
-    # We passed a single string, so take the first vector
-    return embeddings[0]
-
-
-def get_embedding(text: str) -> List[float]:
-    """Wrapper in case we add more providers later."""
-    return get_embedding_ollama(text)
+    for root, _, files in os.walk(doc_dir):
+        for fn in files:
+            if fn.lower().endswith((".txt", ".md")):
+                paths.append(os.path.join(root, fn))
+    return sorted(paths)
 
 
 # =========================
-# INDEX WRITERS
+# CHUNK COMMAND
 # =========================
 
-class BaseIndexWriter:
-    def add(self, item: Dict[str, Any]):
-        raise NotImplementedError
-
-    def close(self):
-        pass
-
-
-class JsonIndexWriter(BaseIndexWriter):
-    def __init__(self, path: pathlib.Path):
-        self.path = path
-        self.items: List[Dict[str, Any]] = []
-
-    def add(self, item: Dict[str, Any]):
-        self.items.append(item)
-
-    def close(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(self.items, f, ensure_ascii=False, indent=2)
-        print(f"[OK] JSON index saved to: {self.path}")
-
-
-class SqliteIndexWriter(BaseIndexWriter):
-    """
-    Simple SQLite index storing:
-      - doc_path
-      - chunk_index
-      - content
-      - embedding_json (TEXT)
-    """
-
-    def __init__(self, path: pathlib.Path):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
-        self._init_db()
-
-    def _init_db(self):
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_path TEXT NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                start_char INTEGER,
-                end_char INTEGER,
-                content TEXT NOT NULL,
-                embedding_json TEXT NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_chunks_doc_path ON chunks (doc_path)"
-        )
-        self.conn.commit()
-
-    def add(self, item: Dict[str, Any]):
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO chunks (doc_path, chunk_index, start_char, end_char, content, embedding_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                item["doc_path"],
-                item["chunk_index"],
-                item.get("start_char"),
-                item.get("end_char"),
-                item["content"],
-                json.dumps(item["embedding"]),
-            ),
-        )
-        self.conn.commit()
-
-    def close(self):
-        self.conn.close()
-        print(f"[OK] SQLite index saved to: {self.path}")
-
-
-class FaissIndexWriter(BaseIndexWriter):
-    """
-    FAISS index + separate metadata JSON.
-    We keep:
-      - FAISS index (vectors)
-      - metadata list with doc_path, chunk_index, content ranges
-    """
-
-    def __init__(self, index_path: pathlib.Path, meta_path: pathlib.Path):
-        if not HAS_FAISS:
-            raise RuntimeError(
-                "faiss is not installed. Install with `pip install faiss-cpu`."
-            )
-
-        self.index_path = index_path
-        self.meta_path = meta_path
-        self.vectors: List[List[float]] = []
-        self.metas: List[Dict[str, Any]] = []
-        self.dim: Optional[int] = None
-
-    def add(self, item: Dict[str, Any]):
-        emb = item["embedding"]
-        if self.dim is None:
-            self.dim = len(emb)
-        elif len(emb) != self.dim:
-            raise ValueError("Inconsistent embedding dimension in FAISS index")
-
-        self.vectors.append(emb)
-        meta = {
-            "doc_path": item["doc_path"],
-            "chunk_index": item["chunk_index"],
-            "start_char": item.get("start_char"),
-            "end_char": item.get("end_char"),
-        }
-        self.metas.append(meta)
-
-    def close(self):
-        if not self.vectors:
-            print("[WARN] No vectors added, skipping FAISS index save.")
-            return
-
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        self.meta_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Convert to numpy
-        vecs = np.array(self.vectors, dtype="float32")
-
-        # Use inner-product index (you can normalize vectors for cosine)
-        index = faiss.IndexFlatIP(self.dim)
-        index.add(vecs)
-        faiss.write_index(index, str(self.index_path))
-
-        with self.meta_path.open("w", encoding="utf-8") as f:
-            json.dump(self.metas, f, ensure_ascii=False, indent=2)
-
-        print(f"[OK] FAISS index saved to: {self.index_path}")
-        print(f"[OK] FAISS metadata saved to: {self.meta_path}")
-
-
-# =========================
-# MAIN PIPELINE
-# =========================
-
-def iter_documents(root_dir: pathlib.Path) -> Iterable[pathlib.Path]:
-    """Yield all candidate document files under root_dir."""
-    for path in root_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        ext = path.suffix.lower()
-        if ext in TEXT_EXTENSIONS or ext in PDF_EXTENSIONS:
-            yield path
-
-
-def build_index(
-    docs_dir: pathlib.Path,
-    index_type: str,
-    index_dir: pathlib.Path,
-):
-    index_type = index_type.lower()
-    index_dir.mkdir(parents=True, exist_ok=True)
-
-    # Prepare writers
-    writers: List[BaseIndexWriter] = []
-
-    if index_type == "json":
-        json_path = index_dir / "day15_index.json"
-        writers.append(JsonIndexWriter(json_path))
-    elif index_type == "sqlite":
-        sqlite_path = index_dir / "day15_index.sqlite3"
-        writers.append(SqliteIndexWriter(sqlite_path))
-    elif index_type == "faiss":
-        faiss_path = index_dir / "day15_index.faiss"
-        meta_path = index_dir / "day15_index_meta.json"
-        writers.append(FaissIndexWriter(faiss_path, meta_path))
-    elif index_type == "all":
-        json_path = index_dir / "day15_index.json"
-        sqlite_path = index_dir / "day15_index.sqlite3"
-        faiss_path = index_dir / "day15_index.faiss"
-        meta_path = index_dir / "day15_index_meta.json"
-
-        writers.append(JsonIndexWriter(json_path))
-        writers.append(SqliteIndexWriter(sqlite_path))
-        if HAS_FAISS:
-            writers.append(FaissIndexWriter(faiss_path, meta_path))
-        else:
-            print("[WARN] faiss not installed – FAISS index will NOT be created.")
-    else:
-        raise ValueError("index_type must be one of: json, sqlite, faiss, all")
-
-    try:
-        doc_paths = list(iter_documents(docs_dir))
-        print(f"[INFO] Found {len(doc_paths)} document(s) in {docs_dir}")
-
-        global_chunk_id = 0
-
-        for doc_idx, doc_path in enumerate(doc_paths, start=1):
-            print(f"\n[DOC {doc_idx}/{len(doc_paths)}] {doc_path}")
-            text = load_document(doc_path)
-            if not text.strip():
-                print("  -> Empty/unsupported document, skipping.")
-                continue
-
-            chunks = chunk_text(text)
-            print(f"  -> {len(chunks)} chunk(s)")
-
-            for chunk_index, (chunk_text_val, start_char, end_char) in enumerate(chunks):
-                global_chunk_id += 1
-                # Maybe small preview for logs
-                preview = textwrap.shorten(
-                    chunk_text_val.replace("\n", " "), width=80
-                )
-
-                print(
-                    f"    [Chunk #{global_chunk_id}] "
-                    f"doc_chunk_index={chunk_index}, "
-                    f"chars={start_char}-{end_char}, "
-                    f"preview='{preview}'"
-                )
-
-                embedding = get_embedding(chunk_text_val)
-
-                item = {
-                    "id": global_chunk_id,
-                    "doc_path": str(doc_path),
-                    "chunk_index": chunk_index,
-                    "start_char": start_char,
-                    "end_char": end_char,
-                    "content": chunk_text_val,
-                    "embedding": embedding,
-                }
-
-                for w in writers:
-                    w.add(item)
-
-        print("\n[INFO] Finished processing all documents.")
-    finally:
-        for w in writers:
-            w.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Day 15 – Documents indexing with Ollama: chunking + embeddings + local index."
-    )
-    parser.add_argument(
-        "--docs-dir",
-        type=str,
-        default=DEFAULT_DOCS_DIR,
-        help="Directory with documents to index (default: ./docs)",
-    )
-    parser.add_argument(
-        "--index-dir",
-        type=str,
-        default=DEFAULT_INDEX_DIR,
-        help="Directory where the index files will be stored (default: ./indexes)",
-    )
-    parser.add_argument(
-        "--index-type",
-        type=str,
-        default="all",
-        choices=["json", "sqlite", "faiss", "all"],
-        help="Which index type to build (default: all)",
-    )
-
-    args = parser.parse_args()
-
-    docs_dir = pathlib.Path(args.docs_dir)
-    index_dir = pathlib.Path(args.index_dir)
-
-    if not docs_dir.exists():
-        print(f"[ERROR] Docs dir does not exist: {docs_dir}")
+def command_chunk(conn: sqlite3.Connection, chunk_size: int = 1000, overlap: int = 200) -> None:
+    if faiss is None:
+        print("RAG disabled: faiss is not installed. Install `faiss-cpu` first.")
         return
 
-    print("=== Day 15 – Documents Indexing (Ollama) ===")
-    print(f"Docs directory   : {docs_dir}")
-    print(f"Index directory  : {index_dir}")
-    print(f"Index type       : {args.index_type}")
-    print(f"Ollama base URL  : {OLLAMA_BASE_URL}")
-    print(f"Ollama embed mdl : {OLLAMA_EMBED_MODEL}")
-    print("===============================")
+    docs = iter_docs()
+    if not docs:
+        print(f"No .txt/.md docs found in '{DOCS_DIR}/'.")
+        return
 
-    build_index(
-        docs_dir=docs_dir,
-        index_type=args.index_type,
-        index_dir=index_dir,
-    )
+    print(f"Rebuilding chunks & embeddings from {len(docs)} docs...")
+    print("Clearing old data from DB...")
+    conn.execute("DELETE FROM embeddings;")
+    conn.execute("DELETE FROM chunks;")
+    conn.commit()
+
+    cur = conn.cursor()
+    total_chunks = 0
+
+    for doc_path in docs:
+        print(f"\n[DOC] {doc_path}")
+        with open(doc_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+
+        chunks = chunk_text(text, size=chunk_size, overlap=overlap)
+        print(f"  -> {len(chunks)} chunks")
+
+        for idx, ch in enumerate(chunks):
+            cur.execute(
+                "INSERT INTO chunks (doc_path, chunk_index, text) VALUES (?, ?, ?)",
+                (doc_path, idx, ch),
+            )
+            chunk_id = cur.lastrowid
+
+            # embed and store as BLOB(float32)
+            emb = get_embedding(ch)
+            vec = np.array(emb, dtype="float32")
+            blob = vec.tobytes()
+            conn.execute(
+                "INSERT INTO embeddings (chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, blob),
+            )
+
+            total_chunks += 1
+
+        conn.commit()
+
+    print(f"\nDone. Total chunks stored: {total_chunks}")
+
+
+# =========================
+# RAG RETRIEVAL
+# =========================
+
+def load_embeddings(conn: sqlite3.Connection) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (chunk_ids, matrix) where matrix is shape [N, dim] float32.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT chunk_id, embedding FROM embeddings ORDER BY chunk_id;")
+    rows = cur.fetchall()
+    if not rows:
+        return np.array([]), np.zeros((0, 0), dtype="float32")
+
+    chunk_ids = []
+    vectors = []
+    for chunk_id, blob in rows:
+        vec = np.frombuffer(blob, dtype="float32")
+        chunk_ids.append(chunk_id)
+        vectors.append(vec)
+
+    matrix = np.vstack(vectors)
+    return np.array(chunk_ids, dtype="int64"), matrix
+
+
+def build_faiss_index(matrix: np.ndarray):
+    dim = matrix.shape[1]
+    # inner product works fine for normalized embeddings; here we just use L2
+    index = faiss.IndexFlatL2(dim)
+    index.add(matrix)
+    return index
+
+
+def retrieve_context(conn: sqlite3.Connection, query: str, top_k: int = TOP_K) -> List[Tuple[str, str]]:
+    """
+    Returns a list of (doc_path, text) for top_k chunks.
+    """
+    if faiss is None:
+        return []
+
+    chunk_ids, matrix = load_embeddings(conn)
+    if matrix.shape[0] == 0:
+        return []
+
+    # Get embedding for query
+    q_emb = get_embedding(query)
+    q_vec = np.array(q_emb, dtype="float32").reshape(1, -1)
+
+    index = build_faiss_index(matrix)
+    distances, indices = index.search(q_vec, min(top_k, matrix.shape[0]))
+
+    retrieved = []
+    cur = conn.cursor()
+    for idx in indices[0]:
+        if idx < 0:
+            continue
+        chunk_id = int(chunk_ids[idx])
+        cur.execute(
+            "SELECT doc_path, text FROM chunks WHERE id = ?;",
+            (chunk_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            retrieved.append((row[0], row[1]))
+
+    return retrieved
+
+
+def build_augmented_prompt(user_question: str, contexts: List[Tuple[str, str]]) -> str:
+    if not contexts:
+        return user_question
+
+    parts = []
+    for i, (path, text) in enumerate(contexts, start=1):
+        snippet = textwrap.shorten(text.replace("\n", " "), width=400, placeholder="...")
+        parts.append(f"Source {i}: {path}\n{text}\n")
+
+    context_block = "\n\n".join(parts)
+
+    prompt = f"""Use the following context from local documents to answer the question.
+
+=== CONTEXT START ===
+{context_block}
+=== CONTEXT END ===
+
+Question: {user_question}
+"""
+
+    return prompt
+
+
+# =========================
+# MAIN LOOP
+# =========================
+
+def main():
+    print("=== Day 16 – The first RAG-request ===")
+    print("Docs folder:", DOCS_DIR)
+    print("DB:", DB_PATH)
+    print("\nCommands:")
+    print("  chunk [size] [overlap]  - (re)chunk docs and build embeddings (defaults: 1000 200)")
+    print("  setrag 0/1              - disable/enable RAG augmentation (default: 0)")
+    print("  exit                    - quit")
+    print("Any other input will be treated as a question.\n")
+
+    conn = init_db()
+    rag_enabled = False
+
+    if faiss is None:
+        print("NOTE: faiss not available → RAG will be effectively OFF even if you setrag 1.\n")
+
+    while True:
+        try:
+            user_input = input("Your input> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+
+        if not user_input:
+            continue
+
+        # exit
+        if user_input.lower() in {"exit", "quit"}:
+            print("Exiting Day 16 script. Goodbye!")
+            break
+
+        # chunk command: "chunk", "chunk 1000", "chunk 1200 200"
+        if user_input.lower().startswith("chunk"):
+            parts = user_input.split()
+            size = 1000
+            overlap = 200
+            if len(parts) >= 2:
+                try:
+                    size = int(parts[1])
+                except ValueError:
+                    print("Invalid chunk size, using default 1000.")
+            if len(parts) >= 3:
+                try:
+                    overlap = int(parts[2])
+                except ValueError:
+                    print("Invalid overlap, using default 200.")
+
+            print(f"\n[CHUNK] size={size}, overlap={overlap}")
+            started = time.time()
+            command_chunk(conn, size, overlap)
+            print(f"[CHUNK] done in {time.time() - started:.1f} s.\n")
+            continue
+
+        # setrag command
+        if user_input.lower().startswith("setrag"):
+            parts = user_input.split()
+            if len(parts) < 2 or parts[1] not in {"0", "1"}:
+                print("Usage: setrag 0 or setrag 1")
+            else:
+                rag_enabled = parts[1] == "1"
+                state = "ON" if rag_enabled else "OFF"
+                print(f"RAG is now {state}.")
+            continue
+
+        # Otherwise – treat as a question
+        question = user_input
+
+        if rag_enabled and faiss is not None:
+            print("\n[RAG] Retrieving context from local documents...")
+            ctx = retrieve_context(conn, question, TOP_K)
+            if not ctx:
+                print("[RAG] No chunks found. Sending plain question.")
+                full_prompt = question
+            else:
+                print(f"[RAG] Found {len(ctx)} relevant chunk(s). Using them to augment the question.")
+                for i, (path, text) in enumerate(ctx, start=1):
+                    preview = textwrap.shorten(text.strip().replace("\n", " "), width=100, placeholder="...")
+                    print(f"  {i}. {path}: {preview}")
+                full_prompt = build_augmented_prompt(question, ctx)
+        else:
+            if rag_enabled and faiss is None:
+                print("[WARN] RAG requested, but faiss not installed → using plain question.")
+            else:
+                print("\n[RAG] RAG is OFF. Sending plain question.")
+            full_prompt = question
+
+        print("\n[LLM] Sending request to YandexGPT...")
+        try:
+            answer = call_llm(full_prompt)
+        except Exception as e:
+            print(f"[LLM ERROR] {e}")
+            continue
+
+        print("\n=== ANSWER ===")
+        print(answer)
+        print("==============\n")
 
 
 if __name__ == "__main__":
