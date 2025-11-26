@@ -33,8 +33,8 @@ YAC_API_KEY = os.getenv("YAC_API_KEY")
 YAGPT_MODEL = os.getenv("YAGPT_MODEL", "yandexgpt-lite")  # or "yandexgpt"
 
 # RAG params
-TOP_K = 5                # how many chunks to actually use for augmentation
-TOP_K_RETRIEVE = 8       # how many chunks to retrieve from FAISS before filtering/reranking
+TOP_K = 3                 # how many chunks to actually use for augmentation at once
+TOP_K_RETRIEVE = 9        # how many chunks to retrieve from FAISS before filtering/reranking
 SIMILARITY_THRESHOLD = 0.6  # minimum cosine similarity to keep a chunk
 
 
@@ -271,19 +271,24 @@ def build_faiss_index(matrix: np.ndarray):
     return index
 
 
-def retrieve_context(
+def retrieve_candidates(
     conn: sqlite3.Connection,
     query: str,
-    top_k: int = TOP_K,
     top_k_retrieve: int = TOP_K_RETRIEVE,
     similarity_threshold: float = SIMILARITY_THRESHOLD,
-) -> List[Tuple[str, str]]:
+):
     """
-    Return up to `top_k` chunks (doc_path, text) after:
-      1. Retrieving `top_k_retrieve` nearest neighbors via cosine similarity.
-      2. Sorting by similarity score (reranking).
-      3. Filtering by similarity_threshold.
-    Also prints debug info with scores for debugging.
+    Retrieve up to `top_k_retrieve` nearest chunks, sort them by similarity,
+    filter by threshold, and return the (possibly filtered) sorted list of
+    candidate dicts:
+      {
+        "chunk_id": int,
+        "doc_path": str,
+        "doc_name": str,
+        "chunk_index": int,
+        "text": str,
+        "score": float
+      }
     """
     if faiss is None:
         return []
@@ -358,16 +363,12 @@ def retrieve_context(
         )
         filtered = candidates
 
-    # Take up to top_k for final context
-    selected = filtered[:top_k]
-
     print(
-        f"\n[RAG] Will augment question with {len(selected)} chunk(s) "
-        f"(threshold={similarity_threshold}, retrieved={len(candidates)}, top_k={top_k})."
+        f"\n[RAG] Total candidates after threshold={similarity_threshold}: "
+        f"{len(filtered)} (retrieved={len(candidates)})."
     )
 
-    # Return just (doc_path, text) for building the prompt
-    return [(c["doc_path"], c["text"]) for c in selected]
+    return filtered
 
 
 def build_augmented_prompt(user_question: str, contexts: List[Tuple[str, str]]) -> str:
@@ -376,8 +377,6 @@ def build_augmented_prompt(user_question: str, contexts: List[Tuple[str, str]]) 
 
     parts = []
     for i, (path, text) in enumerate(contexts, start=1):
-        # snippet is mainly for readability if needed; full text goes into context
-        snippet = textwrap.shorten(text.replace("\n", " "), width=400, placeholder="...")
         parts.append(f"Source {i}: {path}\n{text}\n")
 
     context_block = "\n\n".join(parts)
@@ -399,7 +398,7 @@ Question: {user_question}
 # =========================
 
 def main():
-    print("=== Day 17 – RAG with reranking & threshold ===")
+    print("=== Day 17 – RAG reranking, threshold & alternative chunks ===")
     print("Docs folder:", DOCS_DIR)
     print("DB:", DB_PATH)
     print("\nCommands:")
@@ -465,38 +464,116 @@ def main():
         # Otherwise – treat as a question
         question = user_input
 
+        # We'll keep candidates and offset per question to allow "lower scored" retries
+        candidates = []
+        offset = 0
+
         if rag_enabled and faiss is not None:
             print("\n[RAG] Retrieving context from local documents...")
-            ctx = retrieve_context(conn, question, TOP_K, TOP_K_RETRIEVE, SIMILARITY_THRESHOLD)
-            if not ctx:
+            candidates = retrieve_candidates(conn, question, TOP_K_RETRIEVE, SIMILARITY_THRESHOLD)
+
+            if not candidates:
                 print("[RAG] No chunks found. Sending plain question.")
                 full_prompt = question
-            else:
+                # Direct single call, no alternative chunks available
+                print("\n[LLM] Sending request to YandexGPT...")
+                try:
+                    answer = call_llm(full_prompt)
+                except Exception as e:
+                    print(f"[LLM ERROR] {e}")
+                    continue
+
+                print("\n=== ANSWER ===")
+                print(answer)
+                print("==============\n")
+                # move to next user input
+                continue
+
+            # First group of chunks (top_k)
+            group = candidates[offset: offset + TOP_K]
+            offset += len(group)
+
+            print(
+                f"[RAG] Augmenting question with {len(group)} chunk(s) "
+                f"(TOP_K={TOP_K}, threshold={SIMILARITY_THRESHOLD})."
+            )
+            for i, c in enumerate(group, start=1):
+                preview = textwrap.shorten(c["text"].strip().replace("\n", " "), width=100, placeholder="...")
+                print(f"  {i}. {c['doc_path']}: {preview}")
+
+            ctx = [(c["doc_path"], c["text"]) for c in group]
+            full_prompt = build_augmented_prompt(question, ctx)
+
+            print("\n[LLM] Sending request to YandexGPT...")
+            try:
+                answer = call_llm(full_prompt)
+            except Exception as e:
+                print(f"[LLM ERROR] {e}")
+                continue
+
+            print("\n=== ANSWER ===")
+            print(answer)
+            print("==============\n")
+
+            # Now, as long as there are still unused candidates, offer alternative answers
+            while rag_enabled and offset < len(candidates):
+                try:
+                    choice = input("Do you want another answer with lower scored rag chunks? (y/n) ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nBye!")
+                    return
+
+                if choice != "y":
+                    break
+
+                # Next group of chunks
+                group = candidates[offset: offset + TOP_K]
+                if not group:
+                    print("[RAG] No more chunks to try.")
+                    break
+
+                offset += len(group)
+
                 print(
-                    f"[RAG] Augmenting question with {len(ctx)} chunk(s) "
-                    f"(based on similarity score and threshold={SIMILARITY_THRESHOLD})."
+                    f"\n[RAG] Using another {len(group)} chunk(s) "
+                    f"from lower-scored group."
                 )
-                for i, (path, text) in enumerate(ctx, start=1):
-                    preview = textwrap.shorten(text.strip().replace("\n", " "), width=100, placeholder="...")
-                    print(f"  {i}. {path}: {preview}")
+                for i, c in enumerate(group, start=1):
+                    preview = textwrap.shorten(c["text"].strip().replace("\n", " "), width=100, placeholder="...")
+                    print(f"  {i}. {c['doc_path']}: {preview}")
+
+                ctx = [(c["doc_path"], c["text"]) for c in group]
                 full_prompt = build_augmented_prompt(question, ctx)
+
+                print("\n[LLM] Sending request to YandexGPT with lower-scored chunks...")
+                try:
+                    alt_answer = call_llm(full_prompt)
+                except Exception as e:
+                    print(f"[LLM ERROR] {e}")
+                    break
+
+                print("\n=== ALTERNATIVE ANSWER ===")
+                print(alt_answer)
+                print("================================\n")
+
         else:
+            # RAG is disabled or faiss not available
             if rag_enabled and faiss is None:
                 print("[WARN] RAG requested, but faiss not installed → using plain question.")
             else:
                 print("\n[RAG] RAG is OFF. Sending plain question.")
             full_prompt = question
 
-        print("\n[LLM] Sending request to YandexGPT...")
-        try:
-            answer = call_llm(full_prompt)
-        except Exception as e:
-            print(f"[LLM ERROR] {e}")
-            continue
+            print("\n[LLM] Sending request to YandexGPT...")
+            try:
+                answer = call_llm(full_prompt)
+            except Exception as e:
+                print(f"[LLM ERROR] {e}")
+                continue
 
-        print("\n=== ANSWER ===")
-        print(answer)
-        print("==============\n")
+            print("\n=== ANSWER ===")
+            print(answer)
+            print("==============\n")
 
 
 if __name__ == "__main__":
