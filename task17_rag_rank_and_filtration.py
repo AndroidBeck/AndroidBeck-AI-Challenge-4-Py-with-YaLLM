@@ -32,7 +32,10 @@ YAC_FOLDER = os.getenv("YAC_FOLDER")
 YAC_API_KEY = os.getenv("YAC_API_KEY")
 YAGPT_MODEL = os.getenv("YAGPT_MODEL", "yandexgpt-lite")  # or "yandexgpt"
 
-TOP_K = 5  # how many chunks to retrieve for RAG
+# RAG params
+TOP_K = 5                # how many chunks to actually use for augmentation
+TOP_K_RETRIEVE = 8       # how many chunks to retrieve from FAISS before filtering/reranking
+SIMILARITY_THRESHOLD = 0.6  # minimum cosine similarity to keep a chunk
 
 
 # =========================
@@ -252,9 +255,8 @@ def load_embeddings(conn: sqlite3.Connection) -> Tuple[np.ndarray, np.ndarray]:
 
     matrix = np.vstack(vectors)  # shape: [N, dim]
 
-    # --- NEW: normalize each row to unit length for cosine similarity ---
+    # normalize each row to unit length for cosine similarity
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    # avoid division by zero
     norms = np.clip(norms, 1e-8, None)
     matrix = matrix / norms
 
@@ -269,9 +271,19 @@ def build_faiss_index(matrix: np.ndarray):
     return index
 
 
-def retrieve_context(conn: sqlite3.Connection, query: str, top_k: int = TOP_K) -> List[Tuple[str, str]]:
+def retrieve_context(
+    conn: sqlite3.Connection,
+    query: str,
+    top_k: int = TOP_K,
+    top_k_retrieve: int = TOP_K_RETRIEVE,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+) -> List[Tuple[str, str]]:
     """
-    Returns a list of (doc_path, text) for top_k chunks using cosine similarity.
+    Return up to `top_k` chunks (doc_path, text) after:
+      1. Retrieving `top_k_retrieve` nearest neighbors via cosine similarity.
+      2. Sorting by similarity score (reranking).
+      3. Filtering by similarity_threshold.
+    Also prints debug info with scores for debugging.
     """
     if faiss is None:
         return []
@@ -284,29 +296,78 @@ def retrieve_context(conn: sqlite3.Connection, query: str, top_k: int = TOP_K) -
     q_emb = get_embedding(query)
     q_vec = np.array(q_emb, dtype="float32").reshape(1, -1)
 
-    # --- NEW: normalize query vector for cosine similarity ---
+    # normalize query vector for cosine similarity
     q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
     q_norm = np.clip(q_norm, 1e-8, None)
     q_vec = q_vec / q_norm
 
-    index = build_faiss_index(matrix)  # now uses IndexFlatIP
-    distances, indices = index.search(q_vec, min(top_k, matrix.shape[0]))
+    # Build index and search
+    index = build_faiss_index(matrix)  # IndexFlatIP with cosine similarity
+    k = min(top_k_retrieve, matrix.shape[0])
+    scores, indices = index.search(q_vec, k)
 
-    retrieved = []
     cur = conn.cursor()
-    for idx in indices[0]:
+    candidates = []
+
+    for pos, idx in enumerate(indices[0]):
         if idx < 0:
             continue
+        score = float(scores[0][pos])
         chunk_id = int(chunk_ids[idx])
+
+        # Get metadata for this chunk
         cur.execute(
-            "SELECT doc_path, text FROM chunks WHERE id = ?;",
+            "SELECT doc_path, chunk_index, text FROM chunks WHERE id = ?;",
             (chunk_id,),
         )
         row = cur.fetchone()
-        if row:
-            retrieved.append((row[0], row[1]))
+        if not row:
+            continue
 
-    return retrieved
+        doc_path, chunk_index, text = row
+        candidates.append(
+            {
+                "chunk_id": chunk_id,
+                "doc_path": doc_path,
+                "doc_name": os.path.basename(doc_path),
+                "chunk_index": chunk_index,
+                "text": text,
+                "score": score,  # cosine similarity (since we normalized)
+            }
+        )
+
+    if not candidates:
+        return []
+
+    # Rerank: sort by similarity descending
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    # Debug: print all retrieved candidates with scores
+    print("\n[RAG Debug] Retrieved candidates (sorted by similarity):")
+    for c in candidates:
+        print(f"{c['score']:.4f} — {c['doc_name']} chunk {c['chunk_index']}")
+
+    # Filter by similarity threshold
+    filtered = [c for c in candidates if c["score"] >= similarity_threshold]
+
+    # Fallback if nothing passes the threshold
+    if not filtered:
+        print(
+            f"\n[RAG Debug] No chunks above threshold {similarity_threshold}. "
+            "Falling back to top candidates."
+        )
+        filtered = candidates
+
+    # Take up to top_k for final context
+    selected = filtered[:top_k]
+
+    print(
+        f"\n[RAG] Will augment question with {len(selected)} chunk(s) "
+        f"(threshold={similarity_threshold}, retrieved={len(candidates)}, top_k={top_k})."
+    )
+
+    # Return just (doc_path, text) for building the prompt
+    return [(c["doc_path"], c["text"]) for c in selected]
 
 
 def build_augmented_prompt(user_question: str, contexts: List[Tuple[str, str]]) -> str:
@@ -315,6 +376,7 @@ def build_augmented_prompt(user_question: str, contexts: List[Tuple[str, str]]) 
 
     parts = []
     for i, (path, text) in enumerate(contexts, start=1):
+        # snippet is mainly for readability if needed; full text goes into context
         snippet = textwrap.shorten(text.replace("\n", " "), width=400, placeholder="...")
         parts.append(f"Source {i}: {path}\n{text}\n")
 
@@ -337,7 +399,7 @@ Question: {user_question}
 # =========================
 
 def main():
-    print("=== Day 16 – The first RAG-request ===")
+    print("=== Day 17 – RAG with reranking & threshold ===")
     print("Docs folder:", DOCS_DIR)
     print("DB:", DB_PATH)
     print("\nCommands:")
@@ -364,7 +426,7 @@ def main():
 
         # exit
         if user_input.lower() in {"exit", "quit"}:
-            print("Exiting Day 16 script. Goodbye!")
+            print("Exiting script. Goodbye!")
             break
 
         # chunk command: "chunk", "chunk 1000", "chunk 1200 200"
@@ -405,12 +467,15 @@ def main():
 
         if rag_enabled and faiss is not None:
             print("\n[RAG] Retrieving context from local documents...")
-            ctx = retrieve_context(conn, question, TOP_K)
+            ctx = retrieve_context(conn, question, TOP_K, TOP_K_RETRIEVE, SIMILARITY_THRESHOLD)
             if not ctx:
                 print("[RAG] No chunks found. Sending plain question.")
                 full_prompt = question
             else:
-                print(f"[RAG] Found {len(ctx)} relevant chunk(s). Using them to augment the question.")
+                print(
+                    f"[RAG] Augmenting question with {len(ctx)} chunk(s) "
+                    f"(based on similarity score and threshold={SIMILARITY_THRESHOLD})."
+                )
                 for i, (path, text) in enumerate(ctx, start=1):
                     preview = textwrap.shorten(text.strip().replace("\n", " "), width=100, placeholder="...")
                     print(f"  {i}. {path}: {preview}")
