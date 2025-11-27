@@ -104,7 +104,7 @@ def call_llm(prompt: str) -> str:
     body = {
         "modelUri": f"gpt://{YAC_FOLDER}/{YAGPT_MODEL}",
         "completionOptions": {
-            "maxTokens": "800",
+            "maxTokens": "2500",
             "temperature": 0.2
         },
         "messages": [
@@ -370,17 +370,48 @@ def retrieve_candidates(
     return filtered, candidates
 
 
-def build_augmented_prompt(user_question: str, contexts: List[Tuple[str, str]]) -> str:
-    if not contexts:
+# =========================
+# BUILD AUGMENTED PROMPT — LLM САМА ДЕЛАЕТ RAG QUOTATIONS
+# =========================
+
+def build_augmented_prompt(user_question: str, chunks: List[dict]) -> str:
+    """
+    Build a prompt that:
+    - embeds context chunks with [DOC: doc_name | CHUNK: index]
+    - instructs the model to add a 'RAG quotations:' section at the END
+      listing only chunks that were actually used.
+    """
+    if not chunks:
         return user_question
 
     parts = []
-    for i, (path, text) in enumerate(contexts, start=1):
-        parts.append(f"Source {i}: {path}\n{text}\n")
+    for ch in chunks:
+        doc_name = ch.get("doc_name") or os.path.basename(ch["doc_path"])
+        idx = ch["chunk_index"]
+        text = ch["text"]
+        parts.append(
+            f"[DOC: {doc_name} | CHUNK: {idx}]\n{text}\n"
+        )
 
     context_block = "\n\n".join(parts)
 
     prompt = f"""Use the following context from local documents to answer the question.
+
+The context is split into chunks marked like:
+[DOC: doc_name | CHUNK: chunk_index]
+
+RULES FOR SOURCES:
+1. Use the context when it is helpful to answer the question.
+2. When you USE information from a chunk in your answer, at the END of your answer
+   add a section:
+
+RAG quotations:
+- doc_name chunk chunk_index: "short quote from that chunk"
+- ...
+
+3. Include ONLY chunks that actually influenced your answer.
+4. If you did not use any context, write exactly:
+RAG quotations: none
 
 === CONTEXT START ===
 {context_block}
@@ -393,38 +424,11 @@ Question: {user_question}
 
 
 # =========================
-# RAG QUOTATIONS FORMATTER (DAY 18)
-# =========================
-
-def format_rag_quotations(chunks: List[dict]) -> str:
-    """
-    Build a human-readable block with information about which RAG chunks
-    were provided to the LLM: document name, chunk index and a short quote.
-    """
-    if not chunks:
-        return "RAG quotations: none"
-
-    lines = ["RAG quotations:"]
-    for ch in chunks:
-        doc_name = ch.get("doc_name") or os.path.basename(ch["doc_path"])
-        idx = ch["chunk_index"]
-        # short, single-line quote
-        short_text = textwrap.shorten(
-            ch["text"].replace("\n", " "),
-            width=200,
-            placeholder="..."
-        )
-        lines.append(f"- {doc_name} chunk {idx}: \"{short_text}\"")
-
-    return "\n".join(lines)
-
-
-# =========================
 # MAIN LOOP
 # =========================
 
 def main():
-    print("=== Day 18 – RAG threshold behavior & quotations ===")
+    print("=== Day 18 – RAG threshold behavior & quotations (LLM-driven) ===")
     print("Docs folder:", DOCS_DIR)
     print("DB:", DB_PATH)
     print("\nCommands:")
@@ -546,8 +550,7 @@ def main():
                     )
                     print(f"  {i}. {c['doc_path']}: {preview}")
 
-                ctx = [(c["doc_path"], c["text"]) for c in group]
-                full_prompt = build_augmented_prompt(question, ctx)
+                full_prompt = build_augmented_prompt(question, group)
 
                 print("\n[LLM] Sending request to YandexGPT...")
                 try:
@@ -558,8 +561,6 @@ def main():
 
                 print("\n=== ANSWER ===")
                 print(answer)
-                print()
-                print(format_rag_quotations(group))
                 print("==============\n")
 
                 # Now, as long as there are still unused ABOVE-THRESHOLD candidates,
@@ -596,8 +597,7 @@ def main():
                         )
                         print(f"  {i}. {c['doc_path']}: {preview}")
 
-                    ctx = [(c["doc_path"], c["text"]) for c in group]
-                    full_prompt = build_augmented_prompt(question, ctx)
+                    full_prompt = build_augmented_prompt(question, group)
 
                     print("\n[LLM] Sending request to YandexGPT with other high-similarity chunks...")
                     try:
@@ -608,12 +608,10 @@ def main():
 
                     print("\n=== ALTERNATIVE ANSWER ===")
                     print(alt_answer)
-                    print()
-                    print(format_rag_quotations(group))
                     print("================================\n")
 
-                # After we've exhausted (or declined) above-threshold chunks, we can
-                # optionally also offer below-threshold ones if they exist and differ
+                # После использования всех или части above-threshold чанков
+                # можно опционально предложить below-threshold, если они есть.
                 if len(all_candidates) > len(above_threshold):
                     try:
                         choice = input(
@@ -624,7 +622,6 @@ def main():
                         return
 
                     if choice == "y":
-                        # Build list of below-threshold chunks
                         below = [c for c in all_candidates if c not in above_threshold]
                         offset = 0
                         candidates = below
@@ -649,8 +646,7 @@ def main():
                                 )
                                 print(f"  {i}. {c['doc_path']}: {preview}")
 
-                            ctx = [(c["doc_path"], c["text"]) for c in group]
-                            full_prompt = build_augmented_prompt(question, ctx)
+                            full_prompt = build_augmented_prompt(question, group)
 
                             print("\n[LLM] Sending request to YandexGPT with below-threshold chunks...")
                             try:
@@ -661,8 +657,6 @@ def main():
 
                             print("\n=== ALTERNATIVE ANSWER (below threshold) ===")
                             print(alt_answer)
-                            print()
-                            print(format_rag_quotations(group))
                             print("============================================\n")
 
             else:
@@ -722,8 +716,7 @@ def main():
                         )
                         print(f"  {i}. {c['doc_path']}: {preview}")
 
-                    ctx = [(c["doc_path"], c["text"]) for c in group]
-                    full_prompt = build_augmented_prompt(question, ctx)
+                    full_prompt = build_augmented_prompt(question, group)
 
                     print("\n[LLM] Sending request to YandexGPT with low-similarity chunks...")
                     try:
@@ -734,8 +727,6 @@ def main():
 
                     print("\n=== ALTERNATIVE ANSWER (low similarity) ===")
                     print(alt_answer)
-                    print()
-                    print(format_rag_quotations(group))
                     print("===========================================\n")
 
         else:
