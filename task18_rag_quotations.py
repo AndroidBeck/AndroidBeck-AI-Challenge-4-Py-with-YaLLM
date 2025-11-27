@@ -279,8 +279,12 @@ def retrieve_candidates(
 ):
     """
     Retrieve up to `top_k_retrieve` nearest chunks, sort them by similarity,
-    filter by threshold, and return the (possibly filtered) sorted list of
-    candidate dicts:
+    filter by threshold.
+
+    Returns a tuple:
+      (above_threshold, all_candidates)
+
+    where each list contains dicts:
       {
         "chunk_id": int,
         "doc_path": str,
@@ -291,11 +295,11 @@ def retrieve_candidates(
       }
     """
     if faiss is None:
-        return []
+        return [], []
 
     chunk_ids, matrix = load_embeddings(conn)
     if matrix.shape[0] == 0:
-        return []
+        return [], []
 
     # Get embedding for query
     q_emb = get_embedding(query)
@@ -342,7 +346,7 @@ def retrieve_candidates(
         )
 
     if not candidates:
-        return []
+        return [], []
 
     # Rerank: sort by similarity descending
     candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -355,20 +359,15 @@ def retrieve_candidates(
     # Filter by similarity threshold
     filtered = [c for c in candidates if c["score"] >= similarity_threshold]
 
-    # Fallback if nothing passes the threshold
     if not filtered:
+        print(f"\n[RAG Debug] No chunks above threshold {similarity_threshold}.")
+    else:
         print(
-            f"\n[RAG Debug] No chunks above threshold {similarity_threshold}. "
-            "Falling back to top candidates."
+            f"\n[RAG] Total candidates above threshold={similarity_threshold}: "
+            f"{len(filtered)} (retrieved={len(candidates)})."
         )
-        filtered = candidates
 
-    print(
-        f"\n[RAG] Total candidates after threshold={similarity_threshold}: "
-        f"{len(filtered)} (retrieved={len(candidates)})."
-    )
-
-    return filtered
+    return filtered, candidates
 
 
 def build_augmented_prompt(user_question: str, contexts: List[Tuple[str, str]]) -> str:
@@ -394,7 +393,7 @@ Question: {user_question}
 
 
 # =========================
-# RAG QUOTATIONS FORMATTER (NEW FOR DAY 18)
+# RAG QUOTATIONS FORMATTER (DAY 18)
 # =========================
 
 def format_rag_quotations(chunks: List[dict]) -> str:
@@ -425,7 +424,7 @@ def format_rag_quotations(chunks: List[dict]) -> str:
 # =========================
 
 def main():
-    print("=== Day 17 – RAG reranking, threshold & alternative chunks ===")
+    print("=== Day 18 – RAG threshold behavior & quotations ===")
     print("Docs folder:", DOCS_DIR)
     print("DB:", DB_PATH)
     print("\nCommands:")
@@ -492,17 +491,23 @@ def main():
         question = user_input
 
         # We'll keep candidates and offset per question to allow "lower scored" retries
-        candidates = []
+        above_threshold = []
+        all_candidates = []
         offset = 0
 
         if rag_enabled and faiss is not None:
             print("\n[RAG] Retrieving context from local documents...")
-            candidates = retrieve_candidates(conn, question, TOP_K_RETRIEVE, SIMILARITY_THRESHOLD)
+            above_threshold, all_candidates = retrieve_candidates(
+                conn,
+                question,
+                TOP_K_RETRIEVE,
+                SIMILARITY_THRESHOLD
+            )
 
-            if not candidates:
+            if not all_candidates:
+                # No RAG candidates at all → plain question
                 print("[RAG] No chunks found. Sending plain question.")
                 full_prompt = question
-                # Direct single call, no alternative chunks available
                 print("\n[LLM] Sending request to YandexGPT...")
                 try:
                     answer = call_llm(full_prompt)
@@ -514,79 +519,224 @@ def main():
                 print(answer)
                 print("\nRAG quotations: none")
                 print("==============\n")
-                # move to next user input
                 continue
 
-            # First group of chunks (top_k)
-            group = candidates[offset: offset + TOP_K]
-            offset += len(group)
+            # There ARE candidates, but maybe all are below threshold.
+            if above_threshold:
+                # Normal case: use only chunks above threshold for the first answer
+                candidates = above_threshold
+                print(
+                    f"[RAG] Will use only chunks with similarity >= {SIMILARITY_THRESHOLD} "
+                    f"for the first answer."
+                )
 
-            print(
-                f"[RAG] Augmenting question with {len(group)} chunk(s) "
-                f"(TOP_K={TOP_K}, threshold={SIMILARITY_THRESHOLD})."
-            )
-            for i, c in enumerate(group, start=1):
-                preview = textwrap.shorten(c["text"].strip().replace("\n", " "), width=100, placeholder="...")
-                print(f"  {i}. {c['doc_path']}: {preview}")
-
-            ctx = [(c["doc_path"], c["text"]) for c in group]
-            full_prompt = build_augmented_prompt(question, ctx)
-
-            print("\n[LLM] Sending request to YandexGPT...")
-            try:
-                answer = call_llm(full_prompt)
-            except Exception as e:
-                print(f"[LLM ERROR] {e}")
-                continue
-
-            print("\n=== ANSWER ===")
-            print(answer)
-            print()
-            print(format_rag_quotations(group))
-            print("==============\n")
-
-            # Now, as long as there are still unused candidates, offer alternative answers
-            while rag_enabled and offset < len(candidates):
-                try:
-                    choice = input("Do you want another answer with lower scored rag chunks? (y/n) ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    print("\nBye!")
-                    return
-
-                if choice != "y":
-                    break
-
-                # Next group of chunks
+                # First group of chunks (top_k)
                 group = candidates[offset: offset + TOP_K]
-                if not group:
-                    print("[RAG] No more chunks to try.")
-                    break
-
                 offset += len(group)
 
                 print(
-                    f"\n[RAG] Using another {len(group)} chunk(s) "
-                    f"from lower-scored group."
+                    f"[RAG] Augmenting question with {len(group)} chunk(s) "
+                    f"(TOP_K={TOP_K}, threshold={SIMILARITY_THRESHOLD})."
                 )
                 for i, c in enumerate(group, start=1):
-                    preview = textwrap.shorten(c["text"].strip().replace("\n", " "), width=100, placeholder="...")
+                    preview = textwrap.shorten(
+                        c["text"].strip().replace("\n", " "),
+                        width=100,
+                        placeholder="..."
+                    )
                     print(f"  {i}. {c['doc_path']}: {preview}")
 
                 ctx = [(c["doc_path"], c["text"]) for c in group]
                 full_prompt = build_augmented_prompt(question, ctx)
 
-                print("\n[LLM] Sending request to YandexGPT with lower-scored chunks...")
+                print("\n[LLM] Sending request to YandexGPT...")
                 try:
-                    alt_answer = call_llm(full_prompt)
+                    answer = call_llm(full_prompt)
                 except Exception as e:
                     print(f"[LLM ERROR] {e}")
-                    break
+                    continue
 
-                print("\n=== ALTERNATIVE ANSWER ===")
-                print(alt_answer)
+                print("\n=== ANSWER ===")
+                print(answer)
                 print()
                 print(format_rag_quotations(group))
-                print("================================\n")
+                print("==============\n")
+
+                # Now, as long as there are still unused ABOVE-THRESHOLD candidates,
+                # offer alternative answers with other high-sim chunks.
+                while rag_enabled and offset < len(candidates):
+                    try:
+                        choice = input(
+                            "Do you want another answer with lower scored rag chunks (still above threshold)? (y/n) "
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nBye!")
+                        return
+
+                    if choice != "y":
+                        break
+
+                    # Next group of chunks
+                    group = candidates[offset: offset + TOP_K]
+                    if not group:
+                        print("[RAG] No more chunks to try.")
+                        break
+
+                    offset += len(group)
+
+                    print(
+                        f"\n[RAG] Using another {len(group)} chunk(s) "
+                        f"from lower-scored group (still above threshold)."
+                    )
+                    for i, c in enumerate(group, start=1):
+                        preview = textwrap.shorten(
+                            c["text"].strip().replace("\n", " "),
+                            width=100,
+                            placeholder="..."
+                        )
+                        print(f"  {i}. {c['doc_path']}: {preview}")
+
+                    ctx = [(c["doc_path"], c["text"]) for c in group]
+                    full_prompt = build_augmented_prompt(question, ctx)
+
+                    print("\n[LLM] Sending request to YandexGPT with other high-similarity chunks...")
+                    try:
+                        alt_answer = call_llm(full_prompt)
+                    except Exception as e:
+                        print(f"[LLM ERROR] {e}")
+                        break
+
+                    print("\n=== ALTERNATIVE ANSWER ===")
+                    print(alt_answer)
+                    print()
+                    print(format_rag_quotations(group))
+                    print("================================\n")
+
+                # After we've exhausted (or declined) above-threshold chunks, we can
+                # optionally also offer below-threshold ones if they exist and differ
+                if len(all_candidates) > len(above_threshold):
+                    try:
+                        choice = input(
+                            "Do you want to try additional answers using chunks below the similarity threshold? (y/n) "
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nBye!")
+                        return
+
+                    if choice == "y":
+                        # Build list of below-threshold chunks
+                        below = [c for c in all_candidates if c not in above_threshold]
+                        offset = 0
+                        candidates = below
+
+                        while rag_enabled and offset < len(candidates):
+                            group = candidates[offset: offset + TOP_K]
+                            if not group:
+                                print("[RAG] No more below-threshold chunks to try.")
+                                break
+
+                            offset += len(group)
+
+                            print(
+                                f"\n[RAG] Using {len(group)} chunk(s) "
+                                f"from BELOW-threshold group."
+                            )
+                            for i, c in enumerate(group, start=1):
+                                preview = textwrap.shorten(
+                                    c["text"].strip().replace("\n", " "),
+                                    width=100,
+                                    placeholder="..."
+                                )
+                                print(f"  {i}. {c['doc_path']}: {preview}")
+
+                            ctx = [(c["doc_path"], c["text"]) for c in group]
+                            full_prompt = build_augmented_prompt(question, ctx)
+
+                            print("\n[LLM] Sending request to YandexGPT with below-threshold chunks...")
+                            try:
+                                alt_answer = call_llm(full_prompt)
+                            except Exception as e:
+                                print(f"[LLM ERROR] {e}")
+                                break
+
+                            print("\n=== ALTERNATIVE ANSWER (below threshold) ===")
+                            print(alt_answer)
+                            print()
+                            print(format_rag_quotations(group))
+                            print("============================================\n")
+
+            else:
+                # No chunks above threshold at all:
+                #   → first answer is plain (no RAG),
+                #   → afterwards we offer to try low-similarity chunks.
+                candidates = all_candidates
+                print(
+                    f"[RAG] No chunks above threshold {SIMILARITY_THRESHOLD}. "
+                    "First answer will NOT use RAG context."
+                )
+
+                # First, plain answer
+                full_prompt = question
+                print("\n[LLM] Sending request to YandexGPT (plain question, no RAG)...")
+                try:
+                    answer = call_llm(full_prompt)
+                except Exception as e:
+                    print(f"[LLM ERROR] {e}")
+                    continue
+
+                print("\n=== ANSWER ===")
+                print(answer)
+                print("\nRAG quotations: none")
+                print("==============\n")
+
+                # Now offer to try low-similarity chunks for alternative answers
+                offset = 0
+                while rag_enabled and offset < len(candidates):
+                    try:
+                        choice = input(
+                            "Do you want another answer using low-similarity rag chunks from local docs? (y/n) "
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nBye!")
+                        return
+
+                    if choice != "y":
+                        break
+
+                    group = candidates[offset: offset + TOP_K]
+                    if not group:
+                        print("[RAG] No more chunks to try.")
+                        break
+
+                    offset += len(group)
+
+                    print(
+                        f"\n[RAG] Using {len(group)} low-similarity chunk(s) "
+                        f"from local documents."
+                    )
+                    for i, c in enumerate(group, start=1):
+                        preview = textwrap.shorten(
+                            c["text"].strip().replace("\n", " "),
+                            width=100,
+                            placeholder="..."
+                        )
+                        print(f"  {i}. {c['doc_path']}: {preview}")
+
+                    ctx = [(c["doc_path"], c["text"]) for c in group]
+                    full_prompt = build_augmented_prompt(question, ctx)
+
+                    print("\n[LLM] Sending request to YandexGPT with low-similarity chunks...")
+                    try:
+                        alt_answer = call_llm(full_prompt)
+                    except Exception as e:
+                        print(f"[LLM ERROR] {e}")
+                        break
+
+                    print("\n=== ALTERNATIVE ANSWER (low similarity) ===")
+                    print(alt_answer)
+                    print()
+                    print(format_rag_quotations(group))
+                    print("===========================================\n")
 
         else:
             # RAG is disabled or faiss not available
