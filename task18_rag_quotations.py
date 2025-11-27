@@ -394,6 +394,33 @@ Question: {user_question}
 
 
 # =========================
+# RAG QUOTATIONS FORMATTER (NEW FOR DAY 18)
+# =========================
+
+def format_rag_quotations(chunks: List[dict]) -> str:
+    """
+    Build a human-readable block with information about which RAG chunks
+    were provided to the LLM: document name, chunk index and a short quote.
+    """
+    if not chunks:
+        return "RAG quotations: none"
+
+    lines = ["RAG quotations:"]
+    for ch in chunks:
+        doc_name = ch.get("doc_name") or os.path.basename(ch["doc_path"])
+        idx = ch["chunk_index"]
+        # short, single-line quote
+        short_text = textwrap.shorten(
+            ch["text"].replace("\n", " "),
+            width=200,
+            placeholder="..."
+        )
+        lines.append(f"- {doc_name} chunk {idx}: \"{short_text}\"")
+
+    return "\n".join(lines)
+
+
+# =========================
 # MAIN LOOP
 # =========================
 
@@ -485,6 +512,7 @@ def main():
 
                 print("\n=== ANSWER ===")
                 print(answer)
+                print("\nRAG quotations: none")
                 print("==============\n")
                 # move to next user input
                 continue
@@ -513,6 +541,8 @@ def main():
 
             print("\n=== ANSWER ===")
             print(answer)
+            print()
+            print(format_rag_quotations(group))
             print("==============\n")
 
             # Now, as long as there are still unused candidates, offer alternative answers
@@ -554,6 +584,8 @@ def main():
 
                 print("\n=== ALTERNATIVE ANSWER ===")
                 print(alt_answer)
+                print()
+                print(format_rag_quotations(group))
                 print("================================\n")
 
         else:
@@ -573,6 +605,7 @@ def main():
 
             print("\n=== ANSWER ===")
             print(answer)
+            print("\nRAG quotations: none")
             print("==============\n")
 
 
