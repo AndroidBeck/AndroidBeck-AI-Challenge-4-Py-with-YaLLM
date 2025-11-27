@@ -30,7 +30,7 @@ EMBED_MODEL = "nomic-embed-text"
 YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 YAC_FOLDER = os.getenv("YAC_FOLDER")
 YAC_API_KEY = os.getenv("YAC_API_KEY")
-YAGPT_MODEL = os.getenv("YAGPT_MODEL", "yandexgpt-lite")  # or "yandexgpt"
+YAGPT_MODEL = os.getenv("YAGPT_MODEL", "yandexgpt")  # or "yandexgpt"
 
 # RAG params
 TOP_K = 3                 # how many chunks to actually use for augmentation at once
