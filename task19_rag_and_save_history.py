@@ -33,9 +33,9 @@ YAC_API_KEY = os.getenv("YAC_API_KEY")
 YAGPT_MODEL = os.getenv("YAGPT_MODEL", "yandexgpt")  # or "yandexgpt"
 
 # RAG params
-TOP_K = 3                 # how many chunks to actually use for augmentation at once
-TOP_K_RETRIEVE = 9        # how many chunks to retrieve from FAISS before filtering/reranking
-SIMILARITY_THRESHOLD = 0.6  # minimum cosine similarity to keep a chunk
+TOP_K = 3                  # how many chunks to actually use for augmentation at once
+TOP_K_RETRIEVE = 9         # how many chunks to retrieve from FAISS before filtering/reranking
+SIMILARITY_THRESHOLD = 0.6 # minimum cosine similarity to keep a chunk
 
 
 # =========================
@@ -86,10 +86,22 @@ def get_embedding(text: str) -> List[float]:
 
 
 # =========================
-# YANDEX – LLM CALL
+# YANDEX – LLM CALL (WITH DIALOG HISTORY)
 # =========================
 
-def call_llm(prompt: str) -> str:
+def call_llm(messages: List[dict]) -> str:
+    """
+    Call YandexGPT with full dialog history.
+
+    `messages` should be a list of dicts:
+    [
+      {"role": "user", "text": "..."},
+      {"role": "assistant", "text": "..."},
+      ...
+    ]
+
+    We prepend a single system message here.
+    """
     if not YAC_API_KEY or not YAC_FOLDER:
         raise RuntimeError(
             "YandexGPT config is missing. Please set YAC_FOLDER and YAC_API_KEY env vars."
@@ -101,26 +113,24 @@ def call_llm(prompt: str) -> str:
         "x-folder-id": YAC_FOLDER,
     }
 
+    system_message = {
+        "role": "system",
+        "text": (
+            "You are a helpful assistant. You see the full dialog history in messages. "
+            "When context from local documents is provided in the latest user message, "
+            "you must use it to answer the question. If the context does not contain the "
+            "answer, say that you answer based on your general knowledge. "
+            "Follow any instructions in the latest user message about RAG quotations."
+        ),
+    }
+
     body = {
         "modelUri": f"gpt://{YAC_FOLDER}/{YAGPT_MODEL}",
         "completionOptions": {
             "maxTokens": "2500",
             "temperature": 0.2
         },
-        "messages": [
-            {
-                "role": "system",
-                "text": (
-                    "You are a helpful assistant. When context from local documents is "
-                    "provided, you must use it to answer the question. If context does not "
-                    "contain the answer, say that you answer based on your general knowledge."
-                ),
-            },
-            {
-                "role": "user",
-                "text": prompt,
-            },
-        ],
+        "messages": [system_message] + messages,
     }
 
     resp = requests.post(YAGPT_URL, headers=headers, json=body, timeout=120)
@@ -424,11 +434,11 @@ Question: {user_question}
 
 
 # =========================
-# MAIN LOOP
+# MAIN LOOP (NOW WITH HISTORY)
 # =========================
 
 def main():
-    print("=== Day 18 – RAG threshold behavior & quotations (LLM-driven) ===")
+    print("=== Day 19 – RAG with dialog history (all messages sent each request) ===")
     print("Docs folder:", DOCS_DIR)
     print("DB:", DB_PATH)
     print("\nCommands:")
@@ -439,6 +449,7 @@ def main():
 
     conn = init_db()
     rag_enabled = False
+    history: List[dict] = []  # dialog history without system message
 
     if faiss is None:
         print("NOTE: faiss not available → RAG will be effectively OFF even if you setrag 1.\n")
@@ -512,12 +523,21 @@ def main():
                 # No RAG candidates at all → plain question
                 print("[RAG] No chunks found. Sending plain question.")
                 full_prompt = question
+
+                user_message = {"role": "user", "text": full_prompt}
+                messages_for_llm = history + [user_message]
+
                 print("\n[LLM] Sending request to YandexGPT...")
                 try:
-                    answer = call_llm(full_prompt)
+                    answer = call_llm(messages_for_llm)
                 except Exception as e:
                     print(f"[LLM ERROR] {e}")
                     continue
+
+                history.extend([
+                    user_message,
+                    {"role": "assistant", "text": answer}
+                ])
 
                 print("\n=== ANSWER ===")
                 print(answer)
@@ -552,12 +572,20 @@ def main():
 
                 full_prompt = build_augmented_prompt(question, group)
 
+                user_message = {"role": "user", "text": full_prompt}
+                messages_for_llm = history + [user_message]
+
                 print("\n[LLM] Sending request to YandexGPT...")
                 try:
-                    answer = call_llm(full_prompt)
+                    answer = call_llm(messages_for_llm)
                 except Exception as e:
                     print(f"[LLM ERROR] {e}")
                     continue
+
+                history.extend([
+                    user_message,
+                    {"role": "assistant", "text": answer}
+                ])
 
                 print("\n=== ANSWER ===")
                 print(answer)
@@ -599,12 +627,20 @@ def main():
 
                     full_prompt = build_augmented_prompt(question, group)
 
+                    user_message = {"role": "user", "text": full_prompt}
+                    messages_for_llm = history + [user_message]
+
                     print("\n[LLM] Sending request to YandexGPT with other high-similarity chunks...")
                     try:
-                        alt_answer = call_llm(full_prompt)
+                        alt_answer = call_llm(messages_for_llm)
                     except Exception as e:
                         print(f"[LLM ERROR] {e}")
                         break
+
+                    history.extend([
+                        user_message,
+                        {"role": "assistant", "text": alt_answer}
+                    ])
 
                     print("\n=== ALTERNATIVE ANSWER ===")
                     print(alt_answer)
@@ -648,12 +684,20 @@ def main():
 
                             full_prompt = build_augmented_prompt(question, group)
 
+                            user_message = {"role": "user", "text": full_prompt}
+                            messages_for_llm = history + [user_message]
+
                             print("\n[LLM] Sending request to YandexGPT with below-threshold chunks...")
                             try:
-                                alt_answer = call_llm(full_prompt)
+                                alt_answer = call_llm(messages_for_llm)
                             except Exception as e:
                                 print(f"[LLM ERROR] {e}")
                                 break
+
+                            history.extend([
+                                user_message,
+                                {"role": "assistant", "text": alt_answer}
+                            ])
 
                             print("\n=== ALTERNATIVE ANSWER (below threshold) ===")
                             print(alt_answer)
@@ -671,12 +715,21 @@ def main():
 
                 # First, plain answer
                 full_prompt = question
+
+                user_message = {"role": "user", "text": full_prompt}
+                messages_for_llm = history + [user_message]
+
                 print("\n[LLM] Sending request to YandexGPT (plain question, no RAG)...")
                 try:
-                    answer = call_llm(full_prompt)
+                    answer = call_llm(messages_for_llm)
                 except Exception as e:
                     print(f"[LLM ERROR] {e}")
                     continue
+
+                history.extend([
+                    user_message,
+                    {"role": "assistant", "text": answer}
+                ])
 
                 print("\n=== ANSWER ===")
                 print(answer)
@@ -718,12 +771,20 @@ def main():
 
                     full_prompt = build_augmented_prompt(question, group)
 
+                    user_message = {"role": "user", "text": full_prompt}
+                    messages_for_llm = history + [user_message]
+
                     print("\n[LLM] Sending request to YandexGPT with low-similarity chunks...")
                     try:
-                        alt_answer = call_llm(full_prompt)
+                        alt_answer = call_llm(messages_for_llm)
                     except Exception as e:
                         print(f"[LLM ERROR] {e}")
                         break
+
+                    history.extend([
+                        user_message,
+                        {"role": "assistant", "text": alt_answer}
+                    ])
 
                     print("\n=== ALTERNATIVE ANSWER (low similarity) ===")
                     print(alt_answer)
@@ -735,14 +796,23 @@ def main():
                 print("[WARN] RAG requested, but faiss not installed → using plain question.")
             else:
                 print("\n[RAG] RAG is OFF. Sending plain question.")
+
             full_prompt = question
+
+            user_message = {"role": "user", "text": full_prompt}
+            messages_for_llm = history + [user_message]
 
             print("\n[LLM] Sending request to YandexGPT...")
             try:
-                answer = call_llm(full_prompt)
+                answer = call_llm(messages_for_llm)
             except Exception as e:
                 print(f"[LLM ERROR] {e}")
                 continue
+
+            history.extend([
+                user_message,
+                {"role": "assistant", "text": answer}
+            ])
 
             print("\n=== ANSWER ===")
             print(answer)
